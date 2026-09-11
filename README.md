@@ -1,7 +1,6 @@
 # agent-mailbox
 
 **Let any agent send a message into one of your chats, by name.**
-<img width="876" height="869" alt="image" src="https://github.com/user-attachments/assets/d601ab40-9e06-4fc1-bd2f-a49abd256f74" />
 
 You copy a conversation's name out of your client — say `Project status check` —
 and paste it into some other agent's instructions:
@@ -13,6 +12,8 @@ It arrives there, about a tenth of a second after that agent sends it. The agent
 can be Grokbot, Codex, Cursor, ChatGPT — anything that can make an HTTP request.
 Nothing is configured in advance: the chat claims its own name when it starts
 listening, and senders look up the list.
+
+<img width="578" height="526" alt="image" src="https://github.com/user-attachments/assets/f345b643-82b5-43c8-827a-8aa89e11f8c4" />
 
 ```
   grokbot ─┐                                       ┌─ "Project status check"

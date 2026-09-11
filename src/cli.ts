@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import { readFileSync } from 'node:fs';
+import { AdapterRegistry } from './adapter.js';
 import { AgentRegistry, DEFAULT_CONFIG_PATH, initConfig, loadConfig } from './config.js';
 import { createHttpServer } from './http.js';
+import { MailboxHub } from './hub.js';
 import { handleMcpRequest } from './mcp.js';
 import { MailStore } from './store.js';
 import type { Message } from './types.js';
@@ -89,7 +91,8 @@ const USAGE = `agent-mailbox — a mailbox any agent can post to
   Client  (needs --url/MAILBOX_URL and --token/MAILBOX_TOKEN)
     agent-mailbox whoami
     agent-mailbox agents
-    agent-mailbox send --to <id> --thread <slug> --subject <text> [--body <text>]
+    agent-mailbox send --to <id|vendor:thread> --thread <slug> --subject <text> [--body <text>]
+                                           [--from-thread <id>] [--reply-to <addr>] [--correlation-id <id>]
                                            body also reads stdin when --body is absent
     agent-mailbox inbox [--cursor <n>] [--thread <slug>]
     agent-mailbox watch [--thread <slug>] [--full]
@@ -123,11 +126,15 @@ async function main(): Promise<void> {
       const config = loadConfig(str(flags, 'config', DEFAULT_CONFIG_PATH)!);
       const store = new MailStore({ dir: config.dataDir });
       const agents = new AgentRegistry(config.agents);
+      const adapters = AdapterRegistry.withStubs();
+      const hub = new MailboxHub({ store, agents, adapters });
       const server = createHttpServer({
         store,
         agents,
+        adapters,
+        hub,
         mcpHandler: (req, res, agent, body) =>
-          handleMcpRequest({ store, agents, agent }, req, res, body),
+          handleMcpRequest({ store, agents, hub, agent }, req, res, body),
       });
 
       // A long poll holds a socket for up to five minutes; without this the
@@ -173,21 +180,26 @@ async function main(): Promise<void> {
       const to = str(flags, 'to');
       const thread = str(flags, 'thread');
       const subject = str(flags, 'subject');
-      if (!to || !thread || !subject) die('send needs --to, --thread and --subject');
+      if (!to) die('send needs --to (agent id, chat name, or vendor:thread_id)');
       const body = str(flags, 'body') ?? readFileSync(0, 'utf8');
       if (!body.trim()) die('empty body: pass --body <text> or pipe it on stdin');
       const message = (await api(url, token, '/v1/send', {
         method: 'POST',
         body: JSON.stringify({
           to,
-          thread,
-          subject,
           body,
+          ...(thread ? { thread } : {}),
+          ...(subject ? { subject } : {}),
           ...(str(flags, 'type') ? { type: str(flags, 'type') } : {}),
           ...(str(flags, 'in-reply-to') ? { in_reply_to: str(flags, 'in-reply-to') } : {}),
+          ...(str(flags, 'from-thread') ? { from_thread: str(flags, 'from-thread') } : {}),
+          ...(str(flags, 'reply-to') ? { reply_to: str(flags, 'reply-to') } : {}),
+          ...(str(flags, 'correlation-id') ? { correlation_id: str(flags, 'correlation-id') } : {}),
         }),
       })) as Message;
-      process.stdout.write(`sent ${message.id} (seq ${message.seq}) to ${to} on ${thread}\n`);
+      process.stdout.write(
+        `sent ${message.id} (seq ${message.seq}) to ${message.to} on ${message.thread}\n`
+      );
       return;
     }
 

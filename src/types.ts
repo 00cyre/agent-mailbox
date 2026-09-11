@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { formatAddress, VENDOR_ID } from './protocol.js';
 
 /**
  * The wire protocol.
@@ -59,24 +60,65 @@ export const registerChat = z
 export const MESSAGE_TYPES = ['message', 'request', 'reply', 'ack'] as const;
 export type MessageType = (typeof MESSAGE_TYPES)[number];
 
-/** What a client may send. `from`, `id`, `seq` and `ts` are the server's to assign. */
+/** Wire form of a vendor thread address. */
+const addressObject = z
+  .object({
+    vendor: z.string().regex(VENDOR_ID),
+    thread_id: z.string().min(1).max(256).refine((s) => !/\s/u.test(s), 'thread_id must not contain whitespace'),
+  })
+  .strict();
+
+/** `vendor:thread_id`, a pasted chat name, an agent id, or `{vendor, thread_id}`. */
+const addressWire = z.union([z.string().min(1).max(320), addressObject]);
+
+function wireToString(value: string | { vendor: string; thread_id: string }): string {
+  return typeof value === 'string' ? value : formatAddress(value);
+}
+
+/** What a client may send. `id`, `seq` and `ts` are the server's to assign. */
 export const sendMessage = z
   .object({
     // Deliberately permissive: an agent id, a chat slug, a chat's display name
-    // pasted verbatim out of a client, or "*". The server resolves it and says
-    // so if it cannot — rejecting "Project status check (fork)" here for having
-    // spaces in it would be rejecting the package's main use case.
-    to: z.string().min(1).max(160),
-    thread: z.string().regex(THREAD_ID, 'thread must be a plain slug'),
-    subject: z.string().min(1).max(200),
+    // pasted verbatim out of a client, a `vendor:thread_id` address, or "*".
+    // The hub resolves it and says so if it cannot — rejecting "Project status
+    // check (fork)" here for having spaces in it would be rejecting the
+    // package's original use case.
+    to: addressWire,
+    thread: z.string().regex(THREAD_ID, 'thread must be a plain slug').optional(),
+    subject: z.string().min(1).max(200).optional(),
     body: z.string().min(1).max(256_000),
     type: z.enum(MESSAGE_TYPES).default('message'),
     refs: z.array(z.string().max(512)).max(32).optional(),
     in_reply_to: z.string().max(128).optional(),
+    reply_to: addressWire.optional(),
+    correlation_id: z.string().min(1).max(128).optional(),
+    /**
+     * Originating native thread. Combined with the authenticated agent's
+     * vendor into `from` (`grok:abc`). Prefer this over sending `from`.
+     */
+    from_thread: z.string().min(1).max(256).optional(),
+    /**
+     * Originating address. Allowed only as `vendor:thread_id` whose vendor
+     * matches the token — it is not a way to send as someone else.
+     */
+    from: addressWire.optional(),
   })
-  .strict();
+  .strict()
+  .transform((data) => ({
+    to: wireToString(data.to),
+    body: data.body,
+    type: data.type,
+    ...(data.thread !== undefined ? { thread: data.thread } : {}),
+    ...(data.subject !== undefined ? { subject: data.subject } : {}),
+    ...(data.refs !== undefined ? { refs: data.refs } : {}),
+    ...(data.in_reply_to !== undefined ? { in_reply_to: data.in_reply_to } : {}),
+    ...(data.reply_to !== undefined ? { reply_to: wireToString(data.reply_to) } : {}),
+    ...(data.correlation_id !== undefined ? { correlation_id: data.correlation_id } : {}),
+    ...(data.from_thread !== undefined ? { from_thread: data.from_thread } : {}),
+    ...(data.from !== undefined ? { from: wireToString(data.from) } : {}),
+  }));
 
-export type SendMessage = z.infer<typeof sendMessage>;
+export type SendMessage = z.output<typeof sendMessage>;
 
 export interface Message {
   /** `<utc>-<from>-<rand>`; unique, sortable, and says who wrote it without a lookup. */
@@ -104,6 +146,13 @@ export interface Message {
   body: string;
   refs?: string[];
   in_reply_to?: string;
+  /**
+   * Where a reply must go: a `vendor:thread_id`, agent id, or chat slug.
+   * The hub sets this to `from` for n-to-n mail so the other side can
+   * answer the originating thread without being told twice.
+   */
+  reply_to?: string;
+  correlation_id?: string;
   ts: string;
 }
 
@@ -111,6 +160,12 @@ export interface Agent {
   id: string;
   /** Free text for humans and for `list_agents` — "the Grok bots on Thanos-OF". */
   description?: string;
+  /**
+   * Vendor this agent posts as (`grok`, `codex`, …). Inferred from `id` when
+   * omitted (`grokbot` → `grok`). Required to mint `vendor:thread_id` from
+   * addresses; chat-by-name senders do not need it.
+   */
+  vendor?: string;
   /** sha256 of the token. The token itself is never stored. */
   tokenHash: string;
   /** When false, the agent may read its inbox but not send. */
@@ -131,11 +186,19 @@ export interface Agent {
 export interface PublicAgent {
   id: string;
   description?: string;
+  vendor?: string;
 }
 
 export function publicAgent(agent: Agent): PublicAgent {
   return {
     id: agent.id,
     ...(agent.description !== undefined ? { description: agent.description } : {}),
+    ...(agent.vendor !== undefined ? { vendor: agent.vendor } : {}),
   };
+}
+
+/** Inbox keys for this agent: its id, plus its vendor so `grok:*` reaches grokbot. */
+export function inboxNames(agent: Agent): string[] {
+  if (agent.vendor !== undefined && agent.vendor !== agent.id) return [agent.id, agent.vendor];
+  return [agent.id];
 }

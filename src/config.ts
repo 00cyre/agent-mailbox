@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type { Agent } from './types.js';
 import { AGENT_ID } from './types.js';
+import { inferVendor } from './protocol.js';
 
 /**
  * Who may use this mailbox, and how the server proves it.
@@ -27,6 +28,7 @@ export interface ConfigFile {
     id: string;
     token: string;
     description?: string;
+    vendor?: string;
     canSend?: boolean;
     relay?: boolean;
     disabled?: boolean;
@@ -64,10 +66,12 @@ export function loadConfig(path = DEFAULT_CONFIG_PATH): MailboxConfig {
     if (!entry.token || entry.token.length < 16) {
       throw new Error(`agent "${entry.id}" has no usable token in ${full}`);
     }
+    const vendor = inferVendor(entry.id, entry.vendor);
     return {
       id: entry.id,
       tokenHash: hashToken(entry.token),
       ...(entry.description !== undefined ? { description: entry.description } : {}),
+      ...(vendor !== undefined ? { vendor } : {}),
       ...(entry.canSend !== undefined ? { canSend: entry.canSend } : {}),
       ...(entry.relay !== undefined ? { relay: entry.relay } : {}),
       ...(entry.disabled !== undefined ? { disabled: entry.disabled } : {}),

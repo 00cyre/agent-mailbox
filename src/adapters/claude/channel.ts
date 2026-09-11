@@ -1,7 +1,9 @@
+import { timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { generateToken, hashToken } from '../../config.js';
 import { buildReplyEnvelope, coerceAddress, type Envelope } from '../protocol.js';
 import {
   CHANNEL_INSTRUCTIONS,
@@ -25,6 +27,12 @@ export interface ChannelServerOptions {
   onReply?: (reply: Envelope) => Promise<void>;
   host?: string;
   port?: number;
+  /**
+   * Bearer token required on `POST /send`. One is minted when omitted — this
+   * surface is never unauthenticated, because reaching it means writing a turn
+   * into a live session, not queueing mail someone can ignore.
+   */
+  token?: string;
   statePath?: string;
   now?: () => string;
 }
@@ -182,6 +190,23 @@ export async function serveClaudeChannel(options: ChannelServerOptions): Promise
   const host = options.host ?? '127.0.0.1';
   const statePath = options.statePath ?? defaultStatePath();
   const threadId = normalizeClaudeThreadId(options.threadId);
+  const token = options.token ?? generateToken('channel');
+  const tokenHash = hashToken(token);
+
+  /**
+   * Loopback is not an authorization boundary here. The premise of this machine
+   * is that several agents run on it locally, so "only local processes can
+   * reach the port" describes the attacker, not a defence against one.
+   */
+  function authorized(req: IncomingMessage): boolean {
+    const header = req.headers.authorization;
+    if (typeof header !== 'string') return false;
+    const match = /^Bearer\s+(.+)$/iu.exec(header.trim());
+    if (!match) return false;
+    const a = Buffer.from(hashToken(match[1]!), 'hex');
+    const b = Buffer.from(tokenHash, 'hex');
+    return a.length === b.length && timingSafeEqual(a, b);
+  }
 
   const seen = new Set<string>();
   const deliverOnce: ChannelNotify = async (envelope) => {
@@ -207,6 +232,10 @@ export async function serveClaudeChannel(options: ChannelServerOptions): Promise
     const path = url.pathname.replace(/\/+$/u, '') || '/';
     if (path === '/healthz') return json(res, 200, { status: 'ok', thread: threadId });
     if (req.method === 'POST' && path === '/send') {
+      if (!authorized(req)) {
+        res.setHeader('www-authenticate', 'Bearer');
+        return json(res, 401, { error: { message: 'a bearer token is required to inject into this session' } });
+      }
       const body = (await readBody(req)) as { envelope?: unknown; threadId?: string };
       const envelope = parseEnvelope(body.envelope ?? body);
       const target = envelope.to.thread_id;
@@ -229,6 +258,7 @@ export async function serveClaudeChannel(options: ChannelServerOptions): Promise
     url,
     pid: process.pid,
     updated_at: new Date().toISOString(),
+    token,
   });
 
   const heartbeat = setInterval(() => {
@@ -237,6 +267,7 @@ export async function serveClaudeChannel(options: ChannelServerOptions): Promise
       url,
       pid: process.pid,
       updated_at: new Date().toISOString(),
+      token,
     });
   }, 15_000);
   heartbeat.unref();

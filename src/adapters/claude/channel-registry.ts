@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Envelope, SendResult } from '../protocol.js';
@@ -9,6 +9,16 @@ export interface ChannelListener {
   url: string;
   pid: number;
   updated_at: string;
+  /**
+   * Bearer token for this channel's HTTP face.
+   *
+   * A channel injects straight into a live Claude Code session, which is a
+   * strictly larger capability than dropping a message in the mailbox — so it
+   * authenticates like every other write surface here rather than trusting
+   * loopback. The token lives in this file because the file *is* the discovery
+   * mechanism; that is why it is written 0600.
+   */
+  token?: string;
 }
 
 export interface ChannelState {
@@ -33,8 +43,10 @@ export function loadChannelState(path: string): ChannelState {
 }
 
 export function saveChannelState(path: string, state: ChannelState): void {
-  mkdirSync(dirname(path), { recursive: true });
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  // Holds live channel tokens, same as mailbox.config.json holds agent tokens.
+  chmodSync(path, 0o600);
 }
 
 export function registerListener(path: string, listener: ChannelListener): void {
@@ -92,13 +104,20 @@ export class ChannelRegistry {
 }
 
 export interface ChannelHttpPost {
-  (url: string, envelope: Envelope): Promise<void>;
+  (url: string, envelope: Envelope, token?: string): Promise<void>;
 }
 
-export async function defaultChannelPost(url: string, envelope: Envelope): Promise<void> {
+export async function defaultChannelPost(
+  url: string,
+  envelope: Envelope,
+  token?: string
+): Promise<void> {
   const response = await fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
     body: JSON.stringify({ envelope }),
   });
   if (!response.ok) {
@@ -134,7 +153,7 @@ export class ChannelTransport {
     }
     const remote = lookupListener(this.#statePath, threadId);
     if (!remote) return undefined;
-    await this.#post(`${remote.url.replace(/\/+$/u, '')}/send`, envelope);
+    await this.#post(`${remote.url.replace(/\/+$/u, '')}/send`, envelope, remote.token);
     return { transport: 'channel', delivered: true };
   }
 }

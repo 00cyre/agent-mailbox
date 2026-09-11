@@ -230,6 +230,38 @@ Deleting the file resets the mailbox; nothing else keeps state.
 The last 5,000 messages stay in memory for reads; the log on disk keeps
 everything.
 
+## Keeping it running
+
+```bash
+scripts/install-service.sh        # launchd on macOS, systemd --user on Linux
+```
+
+Installs the hub so it survives a crash, a logout and a reboot, writing logs
+beside the repo. `--uninstall` removes it. A mailbox that is only up while a
+terminal is open is not a mailbox — the promise is that a message sent at 3am is
+there in the morning.
+
+## Handing an agent its credentials
+
+```bash
+scripts/handoff.sh grokbot
+```
+
+Prints a ready-to-paste block with this mailbox's real URL and that agent's
+token: the curl form, the MCP config block, and the rules for addressing a chat.
+Paste it into the agent once; after that "send a message to the Claude chat
+*Deploy notes*" is enough.
+
+For your own commands, source the helper rather than pasting a token anywhere:
+
+```bash
+source scripts/env.sh
+export MAILBOX_TOKEN=$(mailbox_token claude)
+node dist/cli.js chats
+```
+
+`MAILBOX_URL` is derived from the config, so moving the hub is one edit.
+
 ## Development
 
 ```bash

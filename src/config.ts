@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type { Agent } from './types.js';
 import { AGENT_ID } from './types.js';
+import { inferVendor } from './protocol.js';
 
 /**
  * Who may use this mailbox, and how the server proves it.
@@ -27,6 +28,7 @@ export interface ConfigFile {
     id: string;
     token: string;
     description?: string;
+    vendor?: string;
     canSend?: boolean;
     relay?: boolean;
     disabled?: boolean;
@@ -64,10 +66,12 @@ export function loadConfig(path = DEFAULT_CONFIG_PATH): MailboxConfig {
     if (!entry.token || entry.token.length < 16) {
       throw new Error(`agent "${entry.id}" has no usable token in ${full}`);
     }
+    const vendor = inferVendor(entry.id, entry.vendor);
     return {
       id: entry.id,
       tokenHash: hashToken(entry.token),
       ...(entry.description !== undefined ? { description: entry.description } : {}),
+      ...(vendor !== undefined ? { vendor } : {}),
       ...(entry.canSend !== undefined ? { canSend: entry.canSend } : {}),
       ...(entry.relay !== undefined ? { relay: entry.relay } : {}),
       ...(entry.disabled !== undefined ? { disabled: entry.disabled } : {}),
@@ -88,7 +92,8 @@ export function loadConfig(path = DEFAULT_CONFIG_PATH): MailboxConfig {
 /** Write a starter config with freshly minted tokens, and return them once. */
 export function initConfig(
   path: string,
-  agentIds: string[]
+  agentIds: string[],
+  options: { relay?: string; port?: number; dataDir?: string } = {}
 ): { path: string; tokens: { id: string; token: string }[] } {
   const full = resolve(path);
   if (existsSync(full)) throw new Error(`${full} already exists; refusing to overwrite tokens`);
@@ -98,11 +103,19 @@ export function initConfig(
     return { id, token: generateToken(id) };
   });
 
+  if (options.relay !== undefined && !agentIds.includes(options.relay)) {
+    throw new Error(`relay "${options.relay}" is not one of the agents being created`);
+  }
+
   const file: ConfigFile = {
-    port: DEFAULT_PORT,
+    port: options.port ?? DEFAULT_PORT,
     host: '127.0.0.1',
-    dataDir: 'data',
-    agents: tokens.map(({ id, token }) => ({ id, token })),
+    dataDir: options.dataDir ?? 'data',
+    agents: tokens.map(({ id, token }) => ({
+      id,
+      token,
+      ...(id === options.relay ? { relay: true } : {}),
+    })),
   };
 
   writeFileSync(full, `${JSON.stringify(file, null, 2)}\n`, 'utf8');

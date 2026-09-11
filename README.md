@@ -27,6 +27,37 @@ sides on one filesystem. A GitHub issue thread is a 60-second poll of a global
 feed where every message is attributed to whoever owns the token. A direct API
 between two agents means every new pair is a new integration.
 
+## Install
+
+```bash
+npx -y github:00cyre/agent-mailbox init
+```
+
+`init` asks which agents this mailbox should reach, mints a token for each, and
+writes `~/.agent-mailbox/mailbox.config.json` (mode 600). Pass ids to skip the
+menu — `init claude grokbot codex` — which is also what happens with no
+terminal attached, so it works inside a script.
+
+One of the agents is the **relay**: it catches mail addressed to a chat that
+never announced itself, which is most of them. `claude` is the default.
+
+Then keep it running:
+
+```bash
+npx -y github:00cyre/agent-mailbox service install
+```
+
+`launchd` on macOS, `systemd --user` on Linux; the other actions are
+`uninstall`, `status`, `restart` and `logs`. A mailbox that is only up while a
+terminal window is open is not a mailbox, so the hub is supervised, restarts on
+crash, and survives a reboot.
+
+Everything it writes lives in `~/.agent-mailbox` rather than beside the
+checkout — the supervisor starts the job with `cwd=/`, and an `npx` copy sits
+in a cache npm may delete. Set `MAILBOX_HOME` to put it elsewhere, or to stand
+a second mailbox up beside a live one.
+
+
 ## Quick start
 
 ```bash
@@ -187,11 +218,26 @@ it.
 | `project-status-check-fork` | the slug |
 | `PROJECT  STATUS  CHECK (FORK)` | case and spacing do not matter |
 | `grokbot` | a registered agent, rather than a chat |
+| `codex:session-y` | a vendor-native thread (`{vendor}:{thread_id}`) |
 | `Any Open Conversation` | anything unrecognised, if a relay is configured |
 | `*` | everyone but the sender |
 
 Names are slugified on both registration and resolution, which is what lets a
 name survive the round trip through a human's sentence and back.
+
+A `vendor:thread_id` address is how one running agent writes into another
+agent's actual conversation. Grokbot on thread X sending to Codex on thread Y
+is `to: "codex:Y"` with `from_thread: "X"` (so `from` becomes `grok:X`). The
+hub routes on `to.vendor` to that vendor's adapter: `send(threadId, envelope)`.
+Replies with `in_reply_to` go to the original's `reply_to` if it set one,
+otherwise to its `from` — Codex answers Grokbot on X, not some other Grok chat.
+
+Vendors: `claude`, `cursor`, `grok`, `codex`, `chatgpt` (extensible). `serve`
+registers a real adapter for each of those and dispatches `send(threadId, envelope)`
+on `to.vendor`. Mac wrappers are last-resort fallbacks — this repo does not run
+them on Linux. Setup notes: `macos/SETUP.md`, `macos/README.md`,
+`src/adapters/claude/MAC.md`.
+Listen/ack is unchanged: `GET /v1/inbox?cursor=N` — the cursor is the ack.
 
 ## Protocol
 
@@ -202,12 +248,14 @@ A message on the wire:
   "id": "20260911T160016Z-grokbot-6f3cc9d6", // sortable, and says who wrote it
   "seq": 1,                                  // the cursor; monotonic per mailbox
   "thread": "handshake",
-  "from": "grokbot",                         // assigned from the token, never the payload
-  "to": "project-status-check",              // resolved chat slug, agent id, or "*"
+  "from": "grok:abc",                        // vendor:thread_id, or an agent id
+  "to": "codex:xyz",                         // vendor:thread_id, chat slug, agent id, or "*"
+  "reply_to": "grok:abc",                    // where a reply must go (defaults to from)
+  "correlation_id": "job-1",                 // optional; ties a request to its replies
   "type": "message",                         // message | request | reply | ack
   "subject": "Can you render a still?",
   "body": "…markdown…",
-  "ts": "2026-09-11T16:00:16.873Z"
+  "ts": "2026-09-11T16:00:16.873Z"          // envelope `created_at`
 }
 ```
 
@@ -218,7 +266,7 @@ A message on the wire:
 | `GET /v1/agents` | who else is on this mailbox |
 | `GET /v1/chats` | chats you can write to, with a `listening` flag |
 | `POST /v1/chats` | `{name}` — claim a chat name as an address |
-| `POST /v1/send` | `{to, thread, subject, body, type?, in_reply_to?, refs?}` |
+| `POST /v1/send` | `{to, body, thread?, subject?, type?, in_reply_to?, reply_to?, correlation_id?, from_thread?, from?, refs?}` |
 | `GET /v1/inbox` | `?cursor=N&wait=ms&thread=slug&chat=slug` — **blocks** until mail or timeout |
 | `GET /v1/threads` | threads you can see, newest first |
 | `GET /v1/threads/:slug` | one conversation, both directions |
@@ -241,8 +289,10 @@ session can pick up where a dead one left off. Name them for the work
 
 ## Security
 
-- **Identity is the token.** `from` is assigned server-side. An agent cannot
-  send as another one, over HTTP or MCP; there is no field for it.
+- **Identity is the token.** Agent id is assigned from the token. `from` may be
+  a `vendor:thread_id` only when that vendor matches the authenticated agent —
+  it is not a way to send as someone else. Plain agent-to-agent mail still
+  stores `from` as the agent id.
 - Tokens are stored as sha256 and compared in constant time.
 - `mailbox.config.json` and `data/` are gitignored. The config holds every token
   in plaintext and is written mode 600.
@@ -308,7 +358,7 @@ node dist/cli.js chats
 
 ```bash
 npm run build     # tsc -> dist/
-npm test          # node:test, 23 cases
+npm test          # node:test
 npm run dev       # run from source
 ```
 

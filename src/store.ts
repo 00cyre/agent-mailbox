@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import type { Chat, Message, SendMessage } from './types.js';
 import { slugify } from './types.js';
+import { parseAddress } from './protocol.js';
 
 /**
  * The mailbox itself: an append-only log plus the readers waiting on it.
@@ -26,7 +27,7 @@ export interface StoreOptions {
 const DEFAULT_WINDOW = 5_000;
 
 interface Waiter {
-  agent: string;
+  mailboxes: string[];
   cursor: number;
   thread?: string;
   resolve: (messages: Message[]) => void;
@@ -88,15 +89,17 @@ export class MailStore {
     const message: Message = {
       id: `${stamp}-${from}-${randomBytes(4).toString('hex')}`,
       seq: ++this.#seq,
-      thread: input.thread,
+      thread: input.thread ?? 'n2n',
       from,
       to: input.to,
       ...(input.to_name !== undefined ? { to_name: input.to_name } : {}),
       type: input.type,
-      subject: input.subject,
+      subject: input.subject ?? 'message',
       body: input.body,
       ...(input.refs !== undefined ? { refs: input.refs } : {}),
       ...(input.in_reply_to !== undefined ? { in_reply_to: input.in_reply_to } : {}),
+      ...(input.reply_to !== undefined ? { reply_to: input.reply_to } : {}),
+      ...(input.correlation_id !== undefined ? { correlation_id: input.correlation_id } : {}),
       ts,
     };
 
@@ -109,32 +112,68 @@ export class MailStore {
     return message;
   }
 
-  /** Is this message addressed to `agent`? Broadcasts reach everyone but their sender. */
-  #addressed(message: Message, agent: string): boolean {
-    if (message.to === agent) return true;
-    return message.to === '*' && message.from !== agent;
+  get(id: string): Message | undefined {
+    for (let i = this.#messages.length - 1; i >= 0; i -= 1) {
+      const message = this.#messages[i];
+      if (message?.id === id) return message;
+    }
+    return undefined;
   }
 
-  /** Everything addressed to `agent` after `cursor`, oldest first. */
-  since(agent: string, cursor: number, thread?: string): Message[] {
+  #names(mailbox: string | string[]): string[] {
+    return Array.isArray(mailbox) ? mailbox : [mailbox];
+  }
+
+  /**
+   * Is this message addressed to `mailbox`?
+   *
+   * Broadcasts reach everyone but their sender. A vendor name (`codex`)
+   * matches every `codex:<thread>` address so an adapter can poll one inbox
+   * for its whole vendor.
+   */
+  #addressed(message: Message, mailboxes: string[]): boolean {
+    const set = new Set(mailboxes);
+    if (set.has(message.to)) return true;
+    if (message.to === '*') {
+      if (set.has(message.from)) return false;
+      const src = parseAddress(message.from);
+      if (src !== undefined && set.has(src.vendor)) return false;
+      return true;
+    }
+    const dest = parseAddress(message.to);
+    return dest !== undefined && set.has(dest.vendor);
+  }
+
+  /** Sender or recipient of this message — used to recover a whole thread. */
+  #involved(message: Message, mailboxes: string[]): boolean {
+    if (this.#addressed(message, mailboxes)) return true;
+    const set = new Set(mailboxes);
+    if (set.has(message.from)) return true;
+    const src = parseAddress(message.from);
+    return src !== undefined && set.has(src.vendor);
+  }
+
+  /** Everything addressed to `mailbox` after `cursor`, oldest first. */
+  since(mailbox: string | string[], cursor: number, thread?: string): Message[] {
+    const mailboxes = this.#names(mailbox);
     return this.#messages.filter(
       (m) =>
-        m.seq > cursor && this.#addressed(m, agent) && (thread === undefined || m.thread === thread)
+        m.seq > cursor && this.#addressed(m, mailboxes) && (thread === undefined || m.thread === thread)
     );
   }
 
   /** A whole thread, both directions — what an agent reads to recover context. */
-  thread(agent: string, thread: string): Message[] {
-    return this.#messages.filter(
-      (m) => m.thread === thread && (this.#addressed(m, agent) || m.from === agent)
-    );
+  thread(mailbox: string | string[], thread: string): Message[] {
+    const mailboxes = this.#names(mailbox);
+    return this.#messages.filter((m) => m.thread === thread && this.#involved(m, mailboxes));
   }
 
   /** Distinct threads this agent can see, newest activity first. */
-  threads(agent: string): { thread: string; last_seq: number; last_ts: string; count: number }[] {
+  threads(mailbox: string | string[]): { thread: string; last_seq: number; last_ts: string; count: number }[] {
+    const mailboxes = this.#names(mailbox);
     const seen = new Map<string, { thread: string; last_seq: number; last_ts: string; count: number }>();
     for (const m of this.#messages) {
-      if (!this.#addressed(m, agent) && m.from !== agent) continue;
+      if (!this.#involved(m, mailboxes)) continue;
       const prior = seen.get(m.thread);
       if (prior) {
         prior.count += 1;
@@ -159,13 +198,14 @@ export class MailStore {
    * per exchange, which is what makes agent-to-agent chat feel like email
    * instead of conversation.
    */
-  wait(agent: string, cursor: number, timeoutMs: number, thread?: string): Promise<Message[]> {
-    const ready = this.since(agent, cursor, thread);
+  wait(mailbox: string | string[], cursor: number, timeoutMs: number, thread?: string): Promise<Message[]> {
+    const mailboxes = this.#names(mailbox);
+    const ready = this.since(mailboxes, cursor, thread);
     if (ready.length > 0) return Promise.resolve(ready);
 
     return new Promise((resolve) => {
       const waiter: Waiter = {
-        agent,
+        mailboxes,
         cursor,
         ...(thread !== undefined ? { thread } : {}),
         resolve,
@@ -180,11 +220,11 @@ export class MailStore {
 
   #wake(message: Message): void {
     for (const waiter of [...this.#waiters]) {
-      if (!this.#addressed(message, waiter.agent)) continue;
+      if (!this.#addressed(message, waiter.mailboxes)) continue;
       if (waiter.thread !== undefined && waiter.thread !== message.thread) continue;
       this.#waiters.delete(waiter);
       clearTimeout(waiter.timer);
-      waiter.resolve(this.since(waiter.agent, waiter.cursor, waiter.thread));
+      waiter.resolve(this.since(waiter.mailboxes, waiter.cursor, waiter.thread));
     }
   }
 

@@ -133,6 +133,20 @@ describe('threads', () => {
     assert.equal(store.thread('bob', 'chat').length, 2);
   });
 
+  it('delivers vendor:thread mail to a vendor inbox, not the sender\'s', () => {
+    const store = freshStore();
+    store.send('grok:x', {
+      to: 'codex:y',
+      thread: 't',
+      subject: 's',
+      body: 'b',
+      type: 'message',
+    });
+    assert.equal(store.since('codex', 0).length, 1);
+    assert.equal(store.since('grok', 0).length, 0);
+    assert.equal(store.since('alice', 0).length, 0);
+  });
+
   it('lists threads by most recent activity', () => {
     const store = freshStore();
     store.send('alice', note('bob', 'old'));

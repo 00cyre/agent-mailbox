@@ -24,3 +24,25 @@ export {
   type PublicAgent,
   type SendMessage,
 } from './types.js';
+export {
+  KNOWN_VENDORS,
+  VENDOR_ALIASES,
+  VENDOR_ID,
+  addressText,
+  buildReplyEnvelope,
+  coerceAddress,
+  envelopeSchema,
+  formatAddress,
+  formatReplyDestination,
+  inferVendor,
+  isAddress,
+  parseAddress,
+  replyDestination,
+  toEnvelope,
+  type Address,
+  type Envelope,
+  type KnownVendor,
+  type Vendor,
+  type VendorAdapter,
+} from './adapters/protocol.js';
+export { ClaudeAdapter } from './adapters/claude/index.js';

@@ -43,6 +43,16 @@ function str(flags: Flags, key: string, fallback?: string): string | undefined {
   return typeof value === 'string' ? value : fallback;
 }
 
+/** Re-emit parsed flags so a nested command (claude) can parse them itself. */
+function argvFlags(flags: Flags): string[] {
+  const out: string[] = [];
+  for (const [key, value] of Object.entries(flags)) {
+    if (value === true) out.push(`--${key}`);
+    else if (typeof value === 'string') out.push(`--${key}`, value);
+  }
+  return out;
+}
+
 function die(message: string): never {
   process.stderr.write(`${message}\n`);
   process.exit(1);
@@ -96,6 +106,8 @@ const USAGE = `agent-mailbox — a mailbox any agent can post to
                                            long-poll your own inbox, forever
     agent-mailbox listen --as "<chat name>" [--full]
                                            claim a chat name and receive its mail
+    agent-mailbox claude send|listen|channel|serve
+                                           Claude thread adapter (vendor claude)
     agent-mailbox chats                    who is listening, and under what name
     agent-mailbox threads
     agent-mailbox thread <slug>
@@ -236,6 +248,12 @@ async function main(): Promise<void> {
         cursor = whoami.head;
       }
       await pollLoop(url, token, `chat=${encodeURIComponent(chat.slug)}`, cursor, flags['full'] === true);
+      return;
+    }
+
+    case 'claude': {
+      const { runClaudeCli } = await import('./adapters/claude/cli.js');
+      await runClaudeCli([...positional, ...argvFlags(flags)]);
       return;
     }
 

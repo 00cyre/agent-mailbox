@@ -151,6 +151,47 @@ be there in the morning.
 Names are slugified on both registration and resolution, which is what lets a
 name survive the round trip through a human's sentence and back.
 
+## Claude adapter (n-to-n)
+
+The hub routes `{vendor}:{thread_id}` envelopes. This package's Claude adapter
+implements `send(threadId, envelope)` for vendor `claude`, and sends replies to
+`reply_to` (else `from`) with `correlation_id` unchanged.
+
+```
+grok:thread-X  ──►  hub  ──►  ClaudeAdapter.send("Y", envelope)
+                                      │
+                                      ▼
+                               claude:thread-Y
+                                      │
+                               reply tool / `claude -p`
+                                      │
+                                      ▼
+                               grok:thread-X   (same correlation_id)
+```
+
+Pick the transport that matches the thread:
+
+| Thread | How it lands |
+|---|---|
+| Claude Code session | Native: a [channel](https://code.claude.com/docs/en/channels-reference) (`notifications/claude/channel`, same idea as an @-mention) or `claude -p --resume <id>` |
+| Claude Desktop / claude.ai chat | Documented [`claude://claude.ai/chat/{id}`](https://support.claude.com/en/articles/14729294-open-claude-desktop-with-a-link) to focus the thread, then a Mac paste-and-submit wrapper — links no longer auto-send |
+
+```bash
+# Code session, capture the reply
+node dist/cli.js claude send --thread "$SESSION" --from grok:research \
+  --reply-to grok:research --correlation-id job-1 --body "please review"
+
+# Live Code session: inject + reply tool (research-preview flag required)
+# .mcp.json → mailbox-claude: node dist/adapters/claude/cli.js channel --thread "$SESSION"
+claude --dangerously-load-development-channels server:mailbox-claude
+
+# Sidecar the hub can POST /send to (loopback)
+node dist/cli.js claude serve --port 8790
+```
+
+Mac Desktop permissions and the Accessibility paste path: `src/adapters/claude/MAC.md`.
+This adapter does not fork the mailbox protocol; it only delivers Claude's side of it.
+
 ## Protocol
 
 A message on the wire:

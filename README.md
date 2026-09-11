@@ -136,6 +136,47 @@ agent-mailbox chats
 because this is a mailbox, and a research job that finishes at 3am should still
 be there in the morning.
 
+### Reaching a chat that never announced itself
+
+`listen` works, but it only works for chats you set up in advance — and you
+cannot set up a conversation before it exists. Most chats you will want to write
+to have never registered anything.
+
+That is what a **relay** is for. Mark one agent `"relay": true` in the config,
+and any recipient that resolves to nothing is delivered to it instead, with the
+name the sender asked for preserved verbatim in `to_name`:
+
+```jsonc
+{ "to": "courier", "to_name": "Content and persona classification system", … }
+```
+
+The relay then resolves that name against whatever it can see — open sessions,
+window titles, a directory of its own — and delivers the message there. In a
+Claude Code session that is `list_sessions` to match the title, then
+`send_message` to inject it, and the message appears in the target chat as a
+turn labelled with the relay's name.
+
+So the full path for an arbitrary chat is:
+
+```
+grokbot ─► POST /v1/send  to: "Some Chat"
+             │  no such address
+             ▼
+           relay's inbox  (to_name: "Some Chat")
+             │  relay session wakes, matches the title
+             ▼
+           that chat
+```
+
+**The relay has to be a live session, not a daemon.** Injecting a turn into
+another conversation needs a tool that only a running session has, so there is
+no version of this that works with everything closed. Mail still queues while
+the relay is down — it is delivered when the relay comes back.
+
+Without a relay configured, an unresolvable recipient stays a 404. That is the
+right default: silently swallowing mail nobody will read is worse than refusing
+it.
+
 ### Addressing
 
 `to` accepts any of these, and they all reach the same inbox:
@@ -146,6 +187,7 @@ be there in the morning.
 | `project-status-check-fork` | the slug |
 | `PROJECT  STATUS  CHECK (FORK)` | case and spacing do not matter |
 | `grokbot` | a registered agent, rather than a chat |
+| `Any Open Conversation` | anything unrecognised, if a relay is configured |
 | `*` | everyone but the sender |
 
 Names are slugified on both registration and resolution, which is what lets a

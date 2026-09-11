@@ -233,6 +233,95 @@ describe('chats', () => {
   });
 });
 
+describe('relay', () => {
+  // A second server, because the relay is a property of the agent registry and
+  // the suite above deliberately has none.
+  let relayServer: Server;
+  let relayBase: string;
+  let relayDir: string;
+  let relayStore: MailStore;
+  const COURIER = 'mb_courier_testtoken000000000';
+
+  before(async () => {
+    relayDir = mkdtempSync(join(tmpdir(), 'mailbox-relay-'));
+    relayStore = new MailStore({ dir: relayDir });
+    relayServer = createHttpServer({
+      store: relayStore,
+      agents: new AgentRegistry([
+        { id: 'grokbot', tokenHash: hashToken(ALICE) },
+        { id: 'courier', tokenHash: hashToken(COURIER), relay: true },
+      ]),
+    });
+    relayServer.requestTimeout = 0;
+    await new Promise<void>((r) => relayServer.listen(0, '127.0.0.1', r));
+    relayBase = `http://127.0.0.1:${(relayServer.address() as AddressInfo).port}`;
+  });
+
+  after(async () => {
+    relayStore.close();
+    await new Promise<void>((r) => relayServer.close(() => r()));
+    rmSync(relayDir, { recursive: true, force: true });
+  });
+
+  const relaySend = async (body: unknown) => {
+    const response = await fetch(`${relayBase}/v1/send`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${ALICE}`, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return { status: response.status, body: await response.json() as any };
+  };
+
+  it('accepts a chat that never registered, and hands it to the relay', async () => {
+    const { status, body } = await relaySend({
+      to: 'Some Chat That Never Registered',
+      thread: 'research',
+      subject: 'done',
+      body: 'finished',
+    });
+    assert.equal(status, 201);
+    assert.equal(body.to, 'courier');
+    // Verbatim, not slugified: the relay matches this against live session
+    // titles, and that match is better made against what the human typed.
+    assert.equal(body.to_name, 'Some Chat That Never Registered');
+  });
+
+  it('puts relayed mail in the relay agent"s own inbox', async () => {
+    await relaySend({ to: 'Another Unknown Chat', thread: 't', subject: 's', body: 'b' });
+    const response = await fetch(`${relayBase}/v1/inbox?cursor=0&wait=0`, {
+      headers: { authorization: `Bearer ${COURIER}` },
+    });
+    const body = (await response.json()) as any;
+    const relayed = body.data.filter((m: { to_name?: string }) => m.to_name !== undefined);
+    assert.ok(relayed.length >= 1, 'the courier must actually receive what it is meant to deliver');
+  });
+
+  it('does not relay a name that resolves normally', async () => {
+    await fetch(`${relayBase}/v1/chats`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${COURIER}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Registered Chat' }),
+    });
+    const { body } = await relaySend({
+      to: 'Registered Chat',
+      thread: 't',
+      subject: 's',
+      body: 'b',
+    });
+    // A registered chat is delivered directly; routing it through the relay
+    // would add a hop and a dependency on the relay being awake.
+    assert.equal(body.to, 'registered-chat');
+    assert.equal(body.to_name, undefined);
+  });
+
+  it('still 404s when no relay is configured', async () => {
+    // The original suite's server has no relay agent, so it must keep failing
+    // loudly rather than silently dropping mail.
+    const { status } = await send(ALICE, { to: 'Nope', thread: 't', subject: 's', body: 'b' });
+    assert.equal(status, 404);
+  });
+});
+
 describe('routing', () => {
   it('404s an unknown route with a token', async () => {
     assert.equal((await call('/v1/nope', ALICE)).status, 404);

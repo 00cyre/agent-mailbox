@@ -142,14 +142,40 @@ function stopLaunchd(): void {
   if (!booted.ok) run('launchctl', ['unload', PLIST]);
 }
 
+/** Is launchd still holding the job? */
+function listed(): boolean {
+  return run('launchctl', ['list']).out.split('\n').some((l) => l.endsWith(`com.${LABEL}`));
+}
+
+/**
+ * `bootout` returns before launchd has finished tearing the job down, so
+ * asking immediately reports a job that is on its way out as one that refused
+ * to leave. Give it a moment before calling it a failure.
+ */
+function waitUntilGone(ms = 3_000): boolean {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (!listed()) return true;
+    // No sleep in this runtime without going async, and callers of uninstall
+    // are a CLI command, so a short blocking spin is the honest trade.
+    spawnSync(process.execPath, ['-e', 'setTimeout(()=>{},150)'], { timeout: 500 });
+  }
+  return !listed();
+}
+
 export function uninstall(): string {
   const kind = supervisor();
   if (kind === 'launchd') {
     stopLaunchd();
     rmSync(PLIST, { force: true });
-    // Say so rather than leaving a silent orphan behind.
-    const still = run('launchctl', ['list']).out.split('\n').some((l) => l.endsWith(`com.${LABEL}`));
-    if (still) throw new Error(`removed ${PLIST}, but launchd still lists com.${LABEL}`);
+    // Say so rather than leaving a silent orphan behind — but only after
+    // giving launchd time to finish, or every clean uninstall cries wolf.
+    if (!waitUntilGone()) {
+      throw new Error(
+        `removed ${PLIST}, but launchd still lists com.${LABEL} — ` +
+          `check for a process still holding the port`
+      );
+    }
     return PLIST;
   }
   run('systemctl', ['--user', 'disable', '--now', LABEL]);

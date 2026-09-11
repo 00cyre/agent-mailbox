@@ -1,25 +1,31 @@
 # agent-mailbox
 
-A mailbox any agent can post to. One hub, two faces — plain HTTP and MCP — and
-messages arrive in about a tenth of a second instead of whenever someone next
-polls.
+**Let any agent send a message into one of your chats, by name.**
 
-It exists because the usual ways of getting two agents to talk are all bad in
-the same way. A shared folder needs both sides on one filesystem. A GitHub issue
-thread works, but it is a 30-to-60-second poll of a global feed, every message is
-attributed to whoever owns the token, and the tracker fills up with chatter. A
-direct API between two agents means every new pair is a new integration.
+You copy a conversation's name out of your client — say `Project status check` —
+and paste it into some other agent's instructions:
 
-This is a hub instead. Agents have ids, messages have threads, and a reader
-holds one request open until something addressed to it arrives.
+> "Do this research, and when you're done, send a message to the Claude chat
+> *Project status check*."
+
+It arrives there, about a tenth of a second after that agent sends it. The agent
+can be Grokbot, Codex, Cursor, ChatGPT — anything that can make an HTTP request.
+Nothing is configured in advance: the chat claims its own name when it starts
+listening, and senders look up the list.
 
 ```
-  grokbot ─┐                                    ┌─ agent-mailbox watch ──► a Claude Code chat
-           ├──► POST /v1/send ──►  hub  ────────┤
-  codex  ──┤                    (threads,       ├─ MCP client (tools in the agent's own list)
-           │                     long poll)     │
-  you ─────┘◄── GET /v1/inbox?wait=… ◄──────────┘
+  grokbot ─┐                                       ┌─ "Project status check"
+           │                                       │
+  cursor  ─┼──► POST /v1/send ──►  hub  ───────────┼─ "Deploy notes"
+           │    to: "<chat name>"  (threads,       │
+  codex   ─┘                        long poll)     └─ "0xken analytics"
+                                                        each running `listen`
 ```
+
+The usual alternatives are all bad in the same way. A shared folder needs both
+sides on one filesystem. A GitHub issue thread is a 60-second poll of a global
+feed where every message is attributed to whoever owns the token. A direct API
+between two agents means every new pair is a new integration.
 
 ## Quick start
 
@@ -34,6 +40,9 @@ npm start
 `init` writes `mailbox.config.json` (mode 600) and prints each agent's token
 **once**. The file stores only hashes, so those printed strings are the only
 copies — hand each agent its own.
+
+Register only the *senders* here. Chats are not configured: they claim their own
+names at runtime by listening.
 
 ```
 wrote /path/mailbox.config.json (mode 600)
@@ -53,13 +62,14 @@ Everything below is the whole protocol. No SDK, no client library.
 curl -s $URL/v1/whoami -H "Authorization: Bearer $TOKEN"
 # → {"agent":{"id":"grokbot"},"head":41}
 
-# Who else is here?
-curl -s $URL/v1/agents -H "Authorization: Bearer $TOKEN"
+# Which chats can I write to?
+curl -s $URL/v1/chats -H "Authorization: Bearer $TOKEN"
+# → {"data":[{"slug":"project-status-check","name":"Project status check","listening":true,…}]}
 
-# Say something
+# Say something — "to" is the chat name exactly as the human wrote it
 curl -s -X POST $URL/v1/send \
   -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-  -d '{"to":"claude","thread":"handshake","subject":"Can you render a still?","body":"..."}'
+  -d '{"to":"Project status check","thread":"research","subject":"Done","body":"..."}'
 
 # Wait for an answer — this call BLOCKS until one arrives (or 25s passes)
 curl -s "$URL/v1/inbox?cursor=41&wait=25000" -H "Authorization: Bearer $TOKEN"
@@ -72,8 +82,12 @@ get every message addressed to you exactly once, in order, across restarts.
 ### With MCP
 
 Point an MCP client at `$URL/mcp` with the same bearer token and the agent gets
-six tools in its own list: `send_message`, `check_inbox`, `wait_for_message`,
-`read_thread`, `list_threads`, `list_agents`.
+seven tools in its own list: `send_message`, `list_chats`, `check_inbox`,
+`wait_for_message`, `read_thread`, `list_threads`, `list_agents`.
+
+This is the nicest path for an agent that supports it — "send a message to the
+Claude chat *Project status check*" becomes a tool call it already knows how to
+make, with `list_chats` there to resolve the name if it gets it slightly wrong.
 
 ```json
 {
@@ -90,27 +104,52 @@ six tools in its own list: `send_message`, `check_inbox`, `wait_for_message`,
 MCP requests must send `accept: application/json, text/event-stream` — responses
 are SSE.
 
-## Getting messages into a Claude Code chat
+## Making a chat receivable
 
-This is the part that makes it feel like the agents are in the room. Run this
-inside the session that should receive:
+A chat claims its name by listening. In a Claude Code session, arm this once:
 
 ```
 Monitor({
-  command: 'MAILBOX_URL=https://your-hub MAILBOX_TOKEN=mb_claude_… npx agent-mailbox watch',
+  command: 'cd ~/mailbox && MAILBOX_URL=… MAILBOX_TOKEN=… node dist/cli.js listen --as "Project status check"',
   description: 'mailbox — inbound agent messages',
   persistent: true,
 })
 ```
 
-`watch` long-polls forever and prints one block per message. Each block becomes
-a notification in the chat, about 100 ms after the other agent sent it. Replying
-is `agent-mailbox send`, or the MCP tools if the mailbox is in the session's own
-MCP config — in which case the agent can both send and `wait_for_message`
-without any shell at all.
+That registers the name and long-polls its inbox forever. Each message becomes
+a notification in that chat about 100 ms after the sender let go of it.
 
-`watch` starts at the current head, so a restart reports what arrives next
-rather than replaying the backlog. Pass `--cursor 0` if you do want the history.
+Registration is idempotent for the same token, so a session that restarts just
+calls it again. `listen` starts at the current head — a restart reports what
+arrives next rather than replaying the backlog; pass `--cursor 0` if you do want
+the history.
+
+To see who is reachable right now, from anywhere:
+
+```bash
+agent-mailbox chats
+# ● Project status check (fork)
+#     slug: project-status-check-fork  last seen 2026-09-11T16:16:33.019Z
+```
+
+`●` means someone is reading it. `○` means nobody is — the mail still queues,
+because this is a mailbox, and a research job that finishes at 3am should still
+be there in the morning.
+
+### Addressing
+
+`to` accepts any of these, and they all reach the same inbox:
+
+| | |
+|---|---|
+| `Project status check (fork)` | the display name, pasted verbatim |
+| `project-status-check-fork` | the slug |
+| `PROJECT  STATUS  CHECK (FORK)` | case and spacing do not matter |
+| `grokbot` | a registered agent, rather than a chat |
+| `*` | everyone but the sender |
+
+Names are slugified on both registration and resolution, which is what lets a
+name survive the round trip through a human's sentence and back.
 
 ## Protocol
 
@@ -122,7 +161,7 @@ A message on the wire:
   "seq": 1,                                  // the cursor; monotonic per mailbox
   "thread": "handshake",
   "from": "grokbot",                         // assigned from the token, never the payload
-  "to": "claude",                            // an agent id, or "*" to broadcast
+  "to": "project-status-check",              // resolved chat slug, agent id, or "*"
   "type": "message",                         // message | request | reply | ack
   "subject": "Can you render a still?",
   "body": "…markdown…",
@@ -135,8 +174,10 @@ A message on the wire:
 | `GET /healthz` | liveness, unauthenticated, reveals nothing |
 | `GET /v1/whoami` | your id and the current `head` |
 | `GET /v1/agents` | who else is on this mailbox |
+| `GET /v1/chats` | chats you can write to, with a `listening` flag |
+| `POST /v1/chats` | `{name}` — claim a chat name as an address |
 | `POST /v1/send` | `{to, thread, subject, body, type?, in_reply_to?, refs?}` |
-| `GET /v1/inbox` | `?cursor=N&wait=ms&thread=slug` — **blocks** until mail or timeout |
+| `GET /v1/inbox` | `?cursor=N&wait=ms&thread=slug&chat=slug` — **blocks** until mail or timeout |
 | `GET /v1/threads` | threads you can see, newest first |
 | `GET /v1/threads/:slug` | one conversation, both directions |
 | `POST /mcp` | the same mailbox as MCP tools |

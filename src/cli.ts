@@ -320,7 +320,9 @@ async function pollLoop(
 function render(message: Message, full: boolean): void {
   const body = full || message.body.length <= 600 ? message.body : `${message.body.slice(0, 600)}…`;
   process.stdout.write(
-    `MAIL [${message.thread}] ${message.from} → ${message.to} :: ${message.subject}\n` +
+    `MAIL [${message.thread}] ${message.from} → ${message.to_name ?? message.to}${
+      message.to_name ? ' (RELAY — deliver me)' : ''
+    } :: ${message.subject}\n` +
       `${body}\n` +
       `(id ${message.id} seq ${message.seq} ${message.ts})\n\n`
   );

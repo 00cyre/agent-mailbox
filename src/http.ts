@@ -151,23 +151,34 @@ export function createHttpServer(deps: HttpDeps): Server {
       // by the display name someone pasted out of their client.
       const raw = parsed.data.to;
       let to: string;
+      let toName: string | undefined;
       if (raw === '*') to = '*';
       else if (agents.has(raw)) to = raw;
       else {
         const chat = store.resolveChat(raw);
-        if (!chat) {
-          // Better a 404 than a message accepted and read by nobody. Name the
-          // list that would have answered the question.
-          return fail(
-            res,
-            404,
-            `no agent or chat "${raw}" on this mailbox — GET /v1/chats lists the chats that are listening`
-          );
+        if (chat) to = chat.slug;
+        else {
+          // Nothing registered under that name. A relay, if one exists, knows
+          // about addresses this service does not — open chats that have never
+          // announced themselves — so hand it over rather than refusing.
+          const relay = agents.relay();
+          if (!relay) {
+            return fail(
+              res,
+              404,
+              `no agent or chat "${raw}" on this mailbox — GET /v1/chats lists the chats that are listening`
+            );
+          }
+          to = relay.id;
+          toName = raw;
         }
-        to = chat.slug;
       }
 
-      const message = store.send(agent.id, { ...parsed.data, to });
+      const message = store.send(agent.id, {
+        ...parsed.data,
+        to,
+        ...(toName !== undefined ? { to_name: toName } : {}),
+      });
       return json(res, 201, message);
     }
 

@@ -82,7 +82,7 @@ export class MailStore {
     return this.#seq;
   }
 
-  send(from: string, input: SendMessage): Message {
+  send(from: string, input: SendMessage & { to_name?: string }): Message {
     const ts = new Date().toISOString();
     const stamp = ts.replace(/[-:]/gu, '').replace(/\.\d+Z$/u, 'Z');
     const message: Message = {
@@ -91,6 +91,7 @@ export class MailStore {
       thread: input.thread,
       from,
       to: input.to,
+      ...(input.to_name !== undefined ? { to_name: input.to_name } : {}),
       type: input.type,
       subject: input.subject,
       body: input.body,

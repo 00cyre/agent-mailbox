@@ -90,6 +90,15 @@ export interface Message {
   thread: string;
   from: string;
   to: string;
+  /**
+   * The name the sender actually asked for, when it did not resolve to a
+   * registered address and was handed to a relay instead.
+   *
+   * Kept verbatim rather than normalised: the relay has to match it against
+   * live session titles, and that match is better made against what a human
+   * typed than against something this service guessed at.
+   */
+  to_name?: string;
   type: MessageType;
   subject: string;
   body: string;
@@ -106,6 +115,15 @@ export interface Agent {
   tokenHash: string;
   /** When false, the agent may read its inbox but not send. */
   canSend?: boolean;
+  /**
+   * Catches mail whose recipient resolves to nothing.
+   *
+   * Without a relay, addressing a chat that has no listener is a 404 and the
+   * sender can do nothing about it. With one, the message is accepted and the
+   * relay decides where it belongs — which is the only way to reach a chat that
+   * has never announced itself, and that is most of them.
+   */
+  relay?: boolean;
   disabled?: boolean;
 }
 

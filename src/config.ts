@@ -23,7 +23,14 @@ export interface ConfigFile {
   port?: number;
   host?: string;
   dataDir?: string;
-  agents: { id: string; token: string; description?: string; canSend?: boolean; disabled?: boolean }[];
+  agents: {
+    id: string;
+    token: string;
+    description?: string;
+    canSend?: boolean;
+    relay?: boolean;
+    disabled?: boolean;
+  }[];
 }
 
 export const DEFAULT_PORT = 8787;
@@ -62,6 +69,7 @@ export function loadConfig(path = DEFAULT_CONFIG_PATH): MailboxConfig {
       tokenHash: hashToken(entry.token),
       ...(entry.description !== undefined ? { description: entry.description } : {}),
       ...(entry.canSend !== undefined ? { canSend: entry.canSend } : {}),
+      ...(entry.relay !== undefined ? { relay: entry.relay } : {}),
       ...(entry.disabled !== undefined ? { disabled: entry.disabled } : {}),
     };
   });
@@ -134,6 +142,11 @@ export class AgentRegistry {
 
   list(): Agent[] {
     return [...this.#byId.values()].filter((a) => !a.disabled);
+  }
+
+  /** The agent that catches unresolvable mail, if one is configured. */
+  relay(): Agent | undefined {
+    return [...this.#byId.values()].find((a) => a.relay === true && !a.disabled);
   }
 
   has(id: string): boolean {

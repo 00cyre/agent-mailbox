@@ -123,18 +123,25 @@ export function createMailboxMcpServer(deps: McpDeps): McpServer {
         // Same resolution as the HTTP face: agent id, then chat by slug or by
         // the display name a human pasted in.
         let to = args.to;
+        let toName: string | undefined;
         if (to !== '*' && !agents.has(to)) {
           const chat = store.resolveChat(to);
-          if (!chat) {
-            throw new Error(
-              `no agent or chat "${to}" on this mailbox; call list_chats or list_agents`
-            );
+          if (chat) to = chat.slug;
+          else {
+            const relay = agents.relay();
+            if (!relay) {
+              throw new Error(
+                `no agent or chat "${to}" on this mailbox; call list_chats or list_agents`
+              );
+            }
+            toName = to;
+            to = relay.id;
           }
-          to = chat.slug;
         }
 
         const message = store.send(agent.id, {
           to,
+          ...(toName !== undefined ? { to_name: toName } : {}),
           thread: args.thread,
           subject: args.subject,
           body: args.body,

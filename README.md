@@ -262,11 +262,48 @@ node dist/cli.js chats
 
 `MAILBOX_URL` is derived from the config, so moving the hub is one edit.
 
+## Cursor and Grok adapters
+
+Cursor and Grok are separate vendors (`cursor`, `grok`), even when the model
+inside Cursor *is* Grok. Addresses are `{vendor}:{thread_id}`. The adapter
+envelope is `id`, `from`, `to`, `reply_to`, `correlation_id`, `body`,
+`created_at`. `send(threadId, envelope)` injects; listen/receive pulls the
+vendor's reply, which **always** goes to `reply_to`.
+
+This is not a second mailbox. The hub still stores mail. The adapter is how a
+specific Cursor or Grok thread is reached.
+
+| Address | Transport | Notes |
+|---|---|---|
+| `cursor:bc-…` | [Cloud Agents API](https://cursor.com/docs/cloud-agent/api/endpoints) `POST /v1/agents/{id}/runs` | `CURSOR_API_KEY`. Reply from run `result` / conversation. |
+| `cursor:<cli-chat-id>` | `agent --resume <id> -p` | [CLI parameters](https://cursor.com/docs/cli/reference/parameters). |
+| `cursor:<desktop-id>` | Mac wrapper | No public inject-by-id API. Tries gated `cursor desktop send`, else cloud deeplink for `bc-…`. |
+| `grok:resp_…` | [xAI Responses API](https://docs.x.ai/developers/model-capabilities/text/generate-text) | `XAI_API_KEY` + `previous_response_id`. Not a grok.com chat. |
+| `grok:<uuid>` | Mac Safari wrapper | `https://grok.com/c/{uuid}` — no public web-chat API. |
+| `grok:grokbot:…` | Mac Grok Bot.app paste | No public thread API; see `macos/SETUP.md`. |
+
+```bash
+CURSOR_API_KEY=… XAI_API_KEY=… node dist/cli.js adapter serve --port 8788
+
+curl -s -X POST http://127.0.0.1:8788/v1/send \
+  -H 'content-type: application/json' \
+  -d '{"from":"cursor:bc-SOURCE","to":"grok:resp_DEST","reply_to":"cursor:bc-SOURCE","body":"status?"}'
+
+curl -s 'http://127.0.0.1:8788/v1/receive?address=grok:resp_DEST&wait=25000'
+```
+
+Mac-only setup (Safari JavaScript from Apple Events, Accessibility for Grok
+Bot, Cursor deeplinks) is in [`macos/SETUP.md`](macos/SETUP.md).
+
+If `MAILBOX_URL` and `MAILBOX_TOKEN` are set, `adapter serve` also long-polls
+the hub as that agent (`cursor` or `grok`) and bridges envelopes in both
+directions.
+
 ## Development
 
 ```bash
 npm run build     # tsc -> dist/
-npm test          # node:test, 23 cases
+npm test          # node:test
 npm run dev       # run from source
 ```
 

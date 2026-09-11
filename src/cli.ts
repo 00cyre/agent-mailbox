@@ -5,6 +5,14 @@ import { createHttpServer } from './http.js';
 import { handleMcpRequest } from './mcp.js';
 import { MailStore } from './store.js';
 import type { Message } from './types.js';
+import {
+  createAdapterServer,
+  createEnvelope,
+  createMailboxClient,
+  defaultAdapterHub,
+  parseAddress,
+  runMailboxBridge,
+} from './adapters/index.js';
 
 /**
  * One binary, two audiences: `serve` runs the hub, everything else is a client
@@ -99,6 +107,13 @@ const USAGE = `agent-mailbox — a mailbox any agent can post to
     agent-mailbox chats                    who is listening, and under what name
     agent-mailbox threads
     agent-mailbox thread <slug>
+
+  Cursor + Grok adapters  (addresses are vendor:thread_id)
+    agent-mailbox adapter serve [--port 8788] [--host 127.0.0.1]
+                                           send/receive HTTP for cursor and grok
+    agent-mailbox adapter send --from <addr> --to <addr> --body <text>
+                                           [--reply-to <addr>] [--wait]
+    agent-mailbox adapter listen --address <addr>
 `;
 
 async function main(): Promise<void> {
@@ -277,10 +292,86 @@ async function main(): Promise<void> {
       return;
     }
 
+    case 'adapter':
+      await adapterCommand(positional, flags);
+      return;
+
     default:
       process.stdout.write(USAGE);
       if (command !== 'help') process.exit(1);
   }
+}
+
+async function adapterCommand(positional: string[], flags: Flags): Promise<void> {
+  const sub = positional[0] ?? 'help';
+  const hub = defaultAdapterHub();
+
+  if (sub === 'serve') {
+    const port = Number(str(flags, 'port', process.env['ADAPTER_PORT'] ?? '8788'));
+    const host = str(flags, 'host', process.env['ADAPTER_HOST'] ?? '127.0.0.1')!;
+    const server = createAdapterServer(hub);
+    server.requestTimeout = 0;
+    server.headersTimeout = 0;
+    await new Promise<void>((resolve) => server.listen(port, host, resolve));
+    process.stdout.write(
+      `cursor+grok adapter on http://${host}:${port}\n` +
+        `  POST /v1/send   {from,to,reply_to,body}\n` +
+        `  GET  /v1/receive?address=cursor:bc-…&wait=ms\n`
+    );
+
+    const token = str(flags, 'token', process.env['MAILBOX_TOKEN']);
+    const mailboxUrl = str(flags, 'url', process.env['MAILBOX_URL']);
+    if (token && mailboxUrl) {
+      const client = await createMailboxClient(mailboxUrl, token);
+      process.stdout.write(`  mailbox bridge ${mailboxUrl} as ${(await client.whoami()).agent.id}\n`);
+      void runMailboxBridge(hub, client).catch((error: unknown) => {
+        process.stderr.write(`bridge: ${error instanceof Error ? error.message : String(error)}\n`);
+      });
+    }
+    return;
+  }
+
+  if (sub === 'send') {
+    const from = str(flags, 'from');
+    const to = str(flags, 'to');
+    const body = str(flags, 'body') ?? (process.stdin.isTTY ? undefined : readFileSync(0, 'utf8'));
+    if (!from || !to || !body?.trim()) die('adapter send needs --from, --to and --body');
+    const replyTo = str(flags, 'reply-to');
+    const envelope = createEnvelope({
+      from,
+      to,
+      body,
+      ...(replyTo ? { reply_to: replyTo } : {}),
+    });
+    const result = await hub.send(envelope);
+    process.stdout.write(
+      `${JSON.stringify({ ...result.envelope, transport: result.transport, native_id: result.nativeId ?? null }, null, 2)}\n`
+    );
+    if (flags['wait'] === true) {
+    const received = await hub.receive(to, result.nativeId, 180_000);
+      for (const reply of received.envelopes) {
+        process.stdout.write(`${JSON.stringify(reply, null, 2)}\n`);
+      }
+    }
+    return;
+  }
+
+  if (sub === 'listen') {
+    const address = str(flags, 'address') ?? positional[1];
+    if (!address) die('adapter listen needs --address {vendor}:{thread_id}');
+    parseAddress(address);
+    let cursor = str(flags, 'cursor');
+    for (;;) {
+      const received = await hub.receive(address, cursor, 25_000);
+      for (const envelope of received.envelopes) {
+        process.stdout.write(`${JSON.stringify(envelope, null, 2)}\n`);
+      }
+      cursor = received.cursor;
+    }
+  }
+
+  process.stdout.write(USAGE);
+  if (sub !== 'help') process.exit(1);
 }
 
 /**

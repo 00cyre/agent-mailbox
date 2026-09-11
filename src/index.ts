@@ -24,3 +24,14 @@ export {
   type PublicAgent,
   type SendMessage,
 } from './types.js';
+export {
+  AdapterHub,
+  CursorAdapter,
+  GrokAdapter,
+  createAdapterServer,
+  createEnvelope,
+  defaultAdapterHub,
+  formatAddress,
+  parseAddress,
+  type Envelope,
+} from './adapters/index.js';

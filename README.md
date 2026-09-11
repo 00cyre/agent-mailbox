@@ -27,6 +27,37 @@ sides on one filesystem. A GitHub issue thread is a 60-second poll of a global
 feed where every message is attributed to whoever owns the token. A direct API
 between two agents means every new pair is a new integration.
 
+## Install
+
+```bash
+npx -y github:00cyre/agent-mailbox init
+```
+
+`init` asks which agents this mailbox should reach, mints a token for each, and
+writes `~/.agent-mailbox/mailbox.config.json` (mode 600). Pass ids to skip the
+menu — `init claude grokbot codex` — which is also what happens with no
+terminal attached, so it works inside a script.
+
+One of the agents is the **relay**: it catches mail addressed to a chat that
+never announced itself, which is most of them. `claude` is the default.
+
+Then keep it running:
+
+```bash
+npx -y github:00cyre/agent-mailbox service install
+```
+
+`launchd` on macOS, `systemd --user` on Linux; the other actions are
+`uninstall`, `status`, `restart` and `logs`. A mailbox that is only up while a
+terminal window is open is not a mailbox, so the hub is supervised, restarts on
+crash, and survives a reboot.
+
+Everything it writes lives in `~/.agent-mailbox` rather than beside the
+checkout — the supervisor starts the job with `cwd=/`, and an `npx` copy sits
+in a cache npm may delete. Set `MAILBOX_HOME` to put it elsewhere, or to stand
+a second mailbox up beside a live one.
+
+
 ## Quick start
 
 ```bash

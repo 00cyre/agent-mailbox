@@ -1,7 +1,16 @@
 #!/usr/bin/env node
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { AdapterRegistry } from './adapter.js';
-import { AgentRegistry, DEFAULT_CONFIG_PATH, initConfig, loadConfig } from './config.js';
+import {
+  AgentRegistry,
+  DEFAULT_CONFIG_PATH,
+  DEFAULT_PORT,
+  initConfig,
+  loadConfig,
+} from './config.js';
+import * as service from './service.js';
+import { chooseAgents } from './wizard.js';
 import { createHttpServer } from './http.js';
 import { MailboxHub } from './hub.js';
 import { handleMcpRequest } from './mcp.js';
@@ -113,8 +122,11 @@ async function api(
 const USAGE = `agent-mailbox — a mailbox any agent can post to
 
   Hub
-    agent-mailbox init [<agent-id>...]     write mailbox.config.json with fresh tokens
+    agent-mailbox init [<agent-id>...]     pick agents, mint tokens, write the config
+                                           asks interactively; ids skip the menu
     agent-mailbox serve [--config <path>]  run the hub (HTTP + MCP)
+    agent-mailbox service <action>         install|uninstall|status|restart|logs
+                                           launchd on macOS, systemd --user on Linux
 
   Client  (needs --url/MAILBOX_URL and --token/MAILBOX_TOKEN)
     agent-mailbox whoami
@@ -145,17 +157,60 @@ async function main(): Promise<void> {
 
   switch (command) {
     case 'init': {
-      const ids = positional.length > 0 ? positional : ['claude', 'peer'];
-      const path = str(flags, 'config', DEFAULT_CONFIG_PATH)!;
-      const { path: written, tokens } = initConfig(path, ids);
-      process.stdout.write(`wrote ${written} (mode 600)\n\n`);
+      // `--config` still wins, but the default now lives beside the service
+      // rather than in whatever directory this was run from: a config in cwd
+      // is invisible to a launchd job whose cwd is `/`.
+      const path = str(flags, 'config', service.CONFIG)!;
+      const choice = await chooseAgents({
+        defaultPort: DEFAULT_PORT,
+        ...(positional.length > 0 ? { preset: positional } : {}),
+      });
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      const { path: written, tokens } = initConfig(path, choice.ids, {
+        relay: choice.relay,
+        port: choice.port,
+        dataDir: service.DATA,
+      });
+      process.stdout.write(`\nwrote ${written} (mode 600)\n\n`);
       for (const { id, token } of tokens) {
-        process.stdout.write(`  ${id.padEnd(16)} ${token}\n`);
+        const tag = id === choice.relay ? ' (relay)' : '';
+        process.stdout.write(`  ${id.padEnd(10)} ${token}${tag}\n`);
       }
       process.stdout.write(
-        `\nThese are the only copies. Give each agent its own; the file stores hashes.\n`
+        `\nThese are the only copies. Give each agent its own; the file stores hashes.\n` +
+          `Next: agent-mailbox service install\n`
       );
       return;
+    }
+
+    case 'service': {
+      const action = positional[0] ?? 'status';
+      switch (action) {
+        case 'install': {
+          const written = service.install();
+          process.stdout.write(
+            `installed ${written} (${service.supervisor()})\n${service.status()}\n`
+          );
+          return;
+        }
+        case 'uninstall':
+          process.stdout.write(`removed ${service.uninstall()}\n`);
+          return;
+        case 'status':
+          process.stdout.write(`${service.status()}\n`);
+          return;
+        case 'restart':
+          service.restart();
+          process.stdout.write(`${service.status()}\n`);
+          return;
+        case 'logs': {
+          const { out, err } = service.logPaths();
+          process.stdout.write(`out: ${out}\nerr: ${err}\n`);
+          return;
+        }
+        default:
+          throw new Error(`unknown: service ${action} (install|uninstall|status|restart|logs)`);
+      }
     }
 
     case 'serve': {

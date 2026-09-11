@@ -92,7 +92,8 @@ export function loadConfig(path = DEFAULT_CONFIG_PATH): MailboxConfig {
 /** Write a starter config with freshly minted tokens, and return them once. */
 export function initConfig(
   path: string,
-  agentIds: string[]
+  agentIds: string[],
+  options: { relay?: string; port?: number; dataDir?: string } = {}
 ): { path: string; tokens: { id: string; token: string }[] } {
   const full = resolve(path);
   if (existsSync(full)) throw new Error(`${full} already exists; refusing to overwrite tokens`);
@@ -102,11 +103,19 @@ export function initConfig(
     return { id, token: generateToken(id) };
   });
 
+  if (options.relay !== undefined && !agentIds.includes(options.relay)) {
+    throw new Error(`relay "${options.relay}" is not one of the agents being created`);
+  }
+
   const file: ConfigFile = {
-    port: DEFAULT_PORT,
+    port: options.port ?? DEFAULT_PORT,
     host: '127.0.0.1',
-    dataDir: 'data',
-    agents: tokens.map(({ id, token }) => ({ id, token })),
+    dataDir: options.dataDir ?? 'data',
+    agents: tokens.map(({ id, token }) => ({
+      id,
+      token,
+      ...(id === options.relay ? { relay: true } : {}),
+    })),
   };
 
   writeFileSync(full, `${JSON.stringify(file, null, 2)}\n`, 'utf8');

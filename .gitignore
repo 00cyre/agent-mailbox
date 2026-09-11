@@ -3,7 +3,15 @@ dist/
 dist-test/
 *.log
 
-# The mailbox's own state and its tokens. Never commit either.
+# The mailbox's own state and its tokens. Never commit any of these.
 data/
 mailbox.config.json
 .env
+
+# handoff.sh writes these, and they contain a live token in plaintext.
+*-HANDOFF.txt
+*-handoff.txt
+
+# Service logs, written beside the repo by install-service.sh.
+hub.log
+hub.err

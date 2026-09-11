@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import type { Server } from 'node:http';
 
+import { AdapterRegistry, StubAdapter } from '../src/adapter.js';
 import { AgentRegistry, hashToken } from '../src/config.js';
 import { createHttpServer } from '../src/http.js';
 import { MailStore } from '../src/store.js';
@@ -13,21 +14,27 @@ import { MailStore } from '../src/store.js';
 const ALICE = 'mb_alice_testtoken0000000000';
 const BOB = 'mb_bob_testtoken00000000000';
 const MUTE = 'mb_mute_testtoken0000000000';
+const GROK = 'mb_grok_testtoken00000000000';
+const CODEX = 'mb_codex_testtoken000000000';
 
 let server: Server;
 let base: string;
 let dir: string;
 let store: MailStore;
+let adapters: AdapterRegistry;
 
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), 'mailbox-http-'));
   store = new MailStore({ dir });
+  adapters = AdapterRegistry.withStubs();
   const agents = new AgentRegistry([
     { id: 'alice', tokenHash: hashToken(ALICE) },
     { id: 'bob', tokenHash: hashToken(BOB), description: 'the other one' },
     { id: 'mute', tokenHash: hashToken(MUTE), canSend: false },
+    { id: 'grok', tokenHash: hashToken(GROK), vendor: 'grok' },
+    { id: 'codex', tokenHash: hashToken(CODEX), vendor: 'codex' },
   ]);
-  server = createHttpServer({ store, agents });
+  server = createHttpServer({ store, agents, adapters });
   server.requestTimeout = 0;
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -76,8 +83,8 @@ describe('auth', () => {
   });
 
   it('identifies the caller from the token, not from the payload', async () => {
-    // `from` is not a field a client can set; spoofing has to go through the
-    // token or not at all.
+    // `from` is only a vendor:thread_id bound to the token's vendor. An agent
+    // id in that field is not a way to send as someone else.
     const sent = await send(ALICE, {
       to: 'bob',
       thread: 'spoof',
@@ -85,7 +92,7 @@ describe('auth', () => {
       body: 'b',
       from: 'bob',
     });
-    assert.equal(sent.status, 400, 'unknown keys are rejected outright');
+    assert.equal(sent.status, 400);
 
     const ok = await send(ALICE, { to: 'bob', thread: 'spoof', subject: 's', body: 'b' });
     assert.equal(ok.status, 201);
@@ -230,6 +237,56 @@ describe('chats', () => {
     const { body } = await call('/v1/inbox?chat=away-chat&cursor=0&wait=0', ALICE);
     assert.equal(body.data.length, 1);
     assert.equal(body.data[0].subject, 'queued');
+  });
+});
+
+describe('n-to-n', () => {
+  it('delivers vendor:thread_id mail onto the destination adapter and inbox', async () => {
+    const sent = await send(GROK, {
+      to: 'codex:session-y',
+      from_thread: 'session-x',
+      body: 'from grok on X',
+      correlation_id: 'job-9',
+    });
+    assert.equal(sent.status, 201);
+    assert.equal(sent.body.from, 'grok:session-x');
+    assert.equal(sent.body.to, 'codex:session-y');
+    assert.equal(sent.body.reply_to, 'grok:session-x');
+    assert.equal(sent.body.correlation_id, 'job-9');
+
+    const stub = adapters.get('codex') as StubAdapter;
+    const last = stub.sent.at(-1);
+    assert.equal(last?.threadId, 'session-y');
+    assert.equal(last?.envelope.body, 'from grok on X');
+
+    const inbox = await call('/v1/inbox?cursor=0&wait=0', CODEX);
+    const hit = inbox.body.data.filter((m: { to: string }) => m.to === 'codex:session-y');
+    assert.equal(hit.length, 1);
+  });
+
+  it('routes a reply to reply_to so Codex answers Grok on the originating thread', async () => {
+    const original = await send(GROK, {
+      to: 'codex:y',
+      from: 'grok:x',
+      reply_to: 'grok:x',
+      body: 'please render',
+    });
+    assert.equal(original.status, 201);
+
+    const reply = await send(CODEX, {
+      to: 'claude:wrong',
+      from_thread: 'y',
+      in_reply_to: original.body.id,
+      type: 'reply',
+      body: 'rendered',
+    });
+    assert.equal(reply.status, 201);
+    assert.equal(reply.body.to, 'grok:x');
+    assert.equal(reply.body.from, 'codex:y');
+
+    const grokInbox = await call('/v1/inbox?cursor=0&wait=0', GROK);
+    const hit = grokInbox.body.data.filter((m: { id: string }) => m.id === reply.body.id);
+    assert.equal(hit.length, 1);
   });
 });
 

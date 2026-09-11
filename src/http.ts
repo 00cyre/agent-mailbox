@@ -1,8 +1,10 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { AdapterRegistry } from './adapter.js';
 import type { AgentRegistry } from './config.js';
+import { HubError, MailboxHub } from './hub.js';
 import type { MailStore } from './store.js';
 import type { Agent } from './types.js';
-import { publicAgent, registerChat, sendMessage } from './types.js';
+import { inboxNames, publicAgent, registerChat, sendMessage } from './types.js';
 
 /**
  * The HTTP face of the mailbox.
@@ -22,6 +24,10 @@ const LISTENING_WINDOW_MS = 90_000;
 export interface HttpDeps {
   store: MailStore;
   agents: AgentRegistry;
+  /** Defaults to stub adapters for the known vendors. */
+  adapters?: AdapterRegistry;
+  /** Defaults to a hub over `store` + `adapters`. Tests pass this to inspect routing. */
+  hub?: MailboxHub;
   /** Mounted at POST /mcp when present. The body is parsed here and handed over. */
   mcpHandler?: (
     req: IncomingMessage,
@@ -73,6 +79,8 @@ function intParam(url: URL, name: string, fallback: number): number {
 
 export function createHttpServer(deps: HttpDeps): Server {
   const { store, agents } = deps;
+  const adapters = deps.adapters ?? AdapterRegistry.withStubs();
+  const hub = deps.hub ?? new MailboxHub({ store, agents, adapters });
 
   return createServer((req, res) => {
     void handle(req, res).catch((error: unknown) => {
@@ -147,28 +155,13 @@ export function createHttpServer(deps: HttpDeps): Server {
       const parsed = sendMessage.safeParse(await readBody(req));
       if (!parsed.success) return fail(res, 400, 'invalid message', parsed.error.format());
 
-      // Resolution order: broadcast, a registered agent, then a chat by slug or
-      // by the display name someone pasted out of their client.
-      const raw = parsed.data.to;
-      let to: string;
-      if (raw === '*') to = '*';
-      else if (agents.has(raw)) to = raw;
-      else {
-        const chat = store.resolveChat(raw);
-        if (!chat) {
-          // Better a 404 than a message accepted and read by nobody. Name the
-          // list that would have answered the question.
-          return fail(
-            res,
-            404,
-            `no agent or chat "${raw}" on this mailbox — GET /v1/chats lists the chats that are listening`
-          );
-        }
-        to = chat.slug;
+      try {
+        const message = await hub.send(agent, parsed.data);
+        return json(res, 201, message);
+      } catch (error) {
+        if (error instanceof HubError) return fail(res, error.status, error.message);
+        throw error;
       }
-
-      const message = store.send(agent.id, { ...parsed.data, to });
-      return json(res, 201, message);
     }
 
     if (req.method === 'GET' && path === '/v1/inbox') {
@@ -180,7 +173,7 @@ export function createHttpServer(deps: HttpDeps): Server {
       // that registered the chat may do so, or one token would read another
       // session's mail.
       const chatParam = url.searchParams.get('chat');
-      let address = agent.id;
+      let address: string | string[] = inboxNames(agent);
       if (chatParam !== null) {
         const chat = store.resolveChat(chatParam);
         if (!chat) return fail(res, 404, `no chat "${chatParam}"`);
@@ -202,13 +195,13 @@ export function createHttpServer(deps: HttpDeps): Server {
     }
 
     if (req.method === 'GET' && path === '/v1/threads') {
-      return json(res, 200, { data: store.threads(agent.id) });
+      return json(res, 200, { data: store.threads(inboxNames(agent)) });
     }
 
     const threadMatch = /^\/v1\/threads\/([^/]+)$/u.exec(path);
     if (req.method === 'GET' && threadMatch) {
       const name = decodeURIComponent(threadMatch[1]!);
-      return json(res, 200, { data: store.thread(agent.id, name) });
+      return json(res, 200, { data: store.thread(inboxNames(agent), name) });
     }
 
     return fail(res, 404, `no such route: ${req.method ?? 'GET'} ${path}`);

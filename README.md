@@ -124,6 +124,38 @@ calls it again. `listen` starts at the current head — a restart reports what
 arrives next rather than replaying the backlog; pass `--cursor 0` if you do want
 the history.
 
+## Codex and ChatGPT threads
+
+Claude can surface an inbound mailbox message in the chat that is already open.
+ChatGPT and Codex Mac apps do not: there is no public send-into-this-thread API
+comparable to an @-mention. Addresses are `{vendor}:{thread_id}` on the hub
+envelope (`id`, `from`, `to`, `reply_to`, `correlation_id`, `body`,
+`created_at`). `from` / `to` / `reply_to` are `{ vendor, thread_id }`. The hub
+calls `adapter.send(threadId, envelope)`; replies go to `reply_to`.
+
+These adapters implement that `VendorAdapter`. They do not invent a second
+protocol. Register them on the hub with `registerOpenaiAdapters(registry)`.
+
+```
+  claude:X  ──envelope──►  hub  ──►  CodexAdapter.send(Y, envelope)
+                                      or adapt chatgpt --thread Y
+                                      native reply ──► hub ──► reply_to (claude:X)
+```
+
+Codex prefers the CLI when it is installed (`codex queue` for a live session,
+`codex exec resume` for a headless turn that returns the assistant message).
+If that fails, the Mac adapter opens `codex://threads/<id>` and pastes. ChatGPT
+consumer threads only have the Mac wrapper (URL + Accessibility) or a loopback
+`POST /send`.
+
+```bash
+# Out-of-process, on the Mac that has the apps (hub may already be local):
+agent-mailbox adapt chatgpt --thread <conversation-uuid>
+agent-mailbox adapt codex --thread <session-uuid>
+```
+
+Setup, permissions, and the loopback wrapper: `macos/README.md`.
+
 To see who is reachable right now, from anywhere:
 
 ```bash
@@ -266,7 +298,7 @@ node dist/cli.js chats
 
 ```bash
 npm run build     # tsc -> dist/
-npm test          # node:test, 23 cases
+    npm test          # node:test
 npm run dev       # run from source
 ```
 

@@ -1,0 +1,16 @@
+function run(argv) {
+  var bundleId = argv[0];
+  var name = argv[1] || '';
+  var se = Application('System Events');
+  var app;
+  try {
+    app = Application(bundleId);
+  } catch (e) {
+    app = name ? Application(name) : null;
+  }
+  if (app) app.activate();
+  delay(0.8);
+  se.keystroke('v', { using: 'command down' });
+  delay(0.25);
+  se.keystroke('\r');
+}

@@ -2,6 +2,28 @@ export { MailStore, type StoreOptions } from './store.js';
 export { createHttpServer, type HttpDeps } from './http.js';
 export { createMailboxMcpServer, handleMcpRequest, type McpDeps } from './mcp.js';
 export {
+  AdapterRegistry,
+  StubAdapter,
+  type Delivery,
+  type VendorAdapter,
+} from './adapter.js';
+export {
+  KNOWN_VENDORS,
+  VENDOR_ALIASES,
+  VENDOR_ID,
+  formatAddress,
+  formatReplyDestination,
+  inferVendor,
+  isAddress,
+  parseAddress,
+  replyDestination,
+  toEnvelope,
+  type Address,
+  type Envelope,
+  type KnownVendor,
+  type Vendor,
+} from './protocol.js';
+export {
   AgentRegistry,
   DEFAULT_CONFIG_PATH,
   DEFAULT_PORT,
@@ -24,3 +46,12 @@ export {
   type PublicAgent,
   type SendMessage,
 } from './types.js';
+export {
+  ChatGptAdapter,
+  CodexAdapter,
+  createVendorAdapter,
+  registerOpenaiAdapters,
+  renderInbound,
+  replyEnvelope,
+  type ListeningAdapter,
+} from './adapters/index.js';

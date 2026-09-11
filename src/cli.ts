@@ -5,6 +5,19 @@ import { createHttpServer } from './http.js';
 import { handleMcpRequest } from './mcp.js';
 import { MailStore } from './store.js';
 import type { Message } from './types.js';
+import {
+  ChatGptAdapter,
+  CodexAdapter,
+  HubClient,
+  MAC_SETUP,
+  createAdapterHttpServer,
+  formatAddress,
+  newEnvelopeId,
+  parseAddress,
+  runBridge,
+  type ListeningAdapter,
+} from './adapters/index.js';
+import type { Envelope } from './protocol.js';
 
 /**
  * One binary, two audiences: `serve` runs the hub, everything else is a client
@@ -99,6 +112,17 @@ const USAGE = `agent-mailbox — a mailbox any agent can post to
     agent-mailbox chats                    who is listening, and under what name
     agent-mailbox threads
     agent-mailbox thread <slug>
+
+  Adapters  (Codex / ChatGPT threads as vendor:thread_id)
+    agent-mailbox adapt chatgpt --thread <conversation-id>
+    agent-mailbox adapt codex --thread <session-id>
+                                           claim chatgpt:<id> or codex:<id> on the hub,
+                                           inject inbound mail into that native thread,
+                                           and post the reply to reply_to
+    agent-mailbox adapt send --to <vendor:thread> --reply-to <addr> [--body <text>]
+                                           one-shot inject (Codex CLI or Mac wrapper)
+    agent-mailbox adapt serve chatgpt|codex --thread <id> [--port 8790]
+                                           loopback POST /send {threadId, envelope}
 `;
 
 async function main(): Promise<void> {
@@ -277,9 +301,134 @@ async function main(): Promise<void> {
       return;
     }
 
+    case 'adapt': {
+      await adaptCommand(positional, flags);
+      return;
+    }
+
     default:
       process.stdout.write(USAGE);
       if (command !== 'help') process.exit(1);
+  }
+}
+
+async function adaptCommand(positional: string[], flags: Flags): Promise<void> {
+  const sub = positional[0];
+  if (sub === 'send') {
+    await adaptSend(flags);
+    return;
+  }
+  if (sub === 'serve') {
+    const vendor = positional[1];
+    if (vendor !== 'codex' && vendor !== 'chatgpt') {
+      die('adapt serve needs a vendor: chatgpt | codex');
+    }
+    const thread = str(flags, 'thread') ?? positional[2];
+    if (!thread) die('adapt serve needs --thread <id>');
+    const adapter = makeAdapter(vendor, flags);
+    const port = Number(str(flags, 'port', '8790'));
+    const adapterToken = str(flags, 'token', process.env['MAILBOX_ADAPTER_TOKEN']);
+    const server = createAdapterHttpServer({
+      adapter,
+      ...(adapterToken ? { token: adapterToken } : {}),
+      replyTimeoutMs: Number(str(flags, 'reply-timeout', '180000')),
+    });
+    const stop = adapter.listen(thread, (body) => {
+      process.stderr.write(`native reply on ${vendor}:${thread} (${body.length} chars)\n`);
+    });
+    const shutdown = (): void => {
+      stop();
+      server.close(() => process.exit(0));
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+    await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));
+    process.stdout.write(
+      `adapter ${vendor} on http://127.0.0.1:${port}\n` +
+        `  POST /send { "threadId": "${thread}", "envelope": { ... } }\n` +
+        (vendor === 'chatgpt' && process.platform !== 'darwin' ? `${MAC_SETUP}\n` : '')
+    );
+    return;
+  }
+  if (sub !== 'codex' && sub !== 'chatgpt') {
+    die('adapt needs chatgpt | codex | send | serve');
+  }
+  const thread = str(flags, 'thread') ?? positional[1];
+  if (!thread) die(`adapt ${sub} needs --thread <id>`);
+  const { url, token } = clientConfig(flags);
+  const adapter = makeAdapter(sub, flags);
+  const httpPort = str(flags, 'http-port');
+  if (httpPort) {
+    const adapterToken = str(flags, 'adapter-token', process.env['MAILBOX_ADAPTER_TOKEN']);
+    const server = createAdapterHttpServer({
+      adapter,
+      ...(adapterToken ? { token: adapterToken } : {}),
+      replyTimeoutMs: Number(str(flags, 'reply-timeout', '180000')),
+    });
+    await new Promise<void>((resolve) => server.listen(Number(httpPort), '127.0.0.1', resolve));
+    process.stderr.write(`adapter http on http://127.0.0.1:${httpPort}/send\n`);
+  }
+  await runBridge({
+    hub: new HubClient({ url, token }),
+    adapter,
+    threadId: thread,
+    replyTimeoutMs: Number(str(flags, 'reply-timeout', '600000')),
+  });
+}
+
+function makeAdapter(vendor: 'codex' | 'chatgpt', flags: Flags): ListeningAdapter {
+  if (vendor === 'codex') {
+    const bin = str(flags, 'codex-bin');
+    return new CodexAdapter({
+      preferQueue: flags['no-queue'] !== true,
+      ...(bin ? { bin } : {}),
+    });
+  }
+  const wrapperUrl = str(flags, 'wrapper');
+  return new ChatGptAdapter({
+    ...(wrapperUrl ? { wrapperUrl } : {}),
+  });
+}
+
+async function adaptSend(flags: Flags): Promise<void> {
+  const to = str(flags, 'to');
+  const replyTo = str(flags, 'reply-to');
+  if (!to || !replyTo) die('adapt send needs --to vendor:thread_id and --reply-to <addr>');
+  const dest = parseAddress(to);
+  if (!dest) die(`adapt send needs --to vendor:thread_id (got ${to})`);
+  const vendor = dest.vendor;
+  if (vendor !== 'codex' && vendor !== 'chatgpt') {
+    die(`adapt send only implements codex and chatgpt addresses (got ${to})`);
+  }
+  const threadId = dest.thread_id;
+  const body = str(flags, 'body') ?? readFileSync(0, 'utf8');
+  if (!body.trim()) die('empty body: pass --body <text> or pipe it on stdin');
+  const fromRaw = str(flags, 'from') ?? 'local:cli';
+  const from = parseAddress(fromRaw) ?? { vendor: dest.vendor, thread_id: fromRaw };
+  const replyParsed = parseAddress(replyTo);
+  const reply_to = replyParsed ?? { vendor: 'agent', thread_id: replyTo };
+  const correlationId = str(flags, 'correlation-id');
+  const envelope: Envelope = {
+    id: newEnvelopeId(),
+    from,
+    to: dest,
+    reply_to,
+    ...(correlationId ? { correlation_id: correlationId } : {}),
+    body,
+    created_at: new Date().toISOString(),
+  };
+  const adapter = makeAdapter(vendor, flags);
+  const waiting = flags['wait'] === true ? adapter.replies.wait(threadId, 600_000) : undefined;
+  const stop = adapter.listen(threadId, () => undefined);
+  try {
+    await adapter.send(threadId, envelope);
+    process.stdout.write(`injected ${envelope.id} into ${formatAddress(dest)}\n`);
+    if (waiting) {
+      const reply = await waiting;
+      process.stdout.write(`${reply}\n`);
+    }
+  } finally {
+    stop();
   }
 }
 

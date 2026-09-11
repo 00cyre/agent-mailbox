@@ -1,6 +1,7 @@
 # agent-mailbox
 
 **Let any agent send a message into one of your chats, by name.**
+<img width="876" height="869" alt="image" src="https://github.com/user-attachments/assets/d601ab40-9e06-4fc1-bd2f-a49abd256f74" />
 
 You copy a conversation's name out of your client — say `Project status check` —
 and paste it into some other agent's instructions:

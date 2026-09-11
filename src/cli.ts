@@ -7,6 +7,24 @@ import { MailboxHub } from './hub.js';
 import { handleMcpRequest } from './mcp.js';
 import { MailStore } from './store.js';
 import type { Message } from './types.js';
+import { formatAddress, parseAddress, type Envelope } from './protocol.js';
+import {
+  createEnvelope,
+  createAdapterHttpServer,
+  createAdapterServer,
+  createMailboxClient,
+  createVendorAdapter,
+  defaultAdapterHub,
+  HubClient,
+  MAC_SETUP,
+  newEnvelopeId,
+  registerClaudeAdapter,
+  registerCursorGrokAdapters,
+  registerOpenaiAdapters,
+  runBridge,
+  runMailboxBridge,
+  type ListeningAdapter,
+} from './adapters/index.js';
 
 /**
  * One binary, two audiences: `serve` runs the hub, everything else is a client
@@ -43,6 +61,16 @@ function parseArgs(argv: string[]): { command: string; positional: string[]; fla
 function str(flags: Flags, key: string, fallback?: string): string | undefined {
   const value = flags[key];
   return typeof value === 'string' ? value : fallback;
+}
+
+/** Re-emit parsed flags so a nested command (claude) can parse them itself. */
+function argvFlags(flags: Flags): string[] {
+  const out: string[] = [];
+  for (const [key, value] of Object.entries(flags)) {
+    if (value === true) out.push(`--${key}`);
+    else if (typeof value === 'string') out.push(`--${key}`, value);
+  }
+  return out;
 }
 
 function die(message: string): never {
@@ -102,6 +130,14 @@ const USAGE = `agent-mailbox — a mailbox any agent can post to
     agent-mailbox chats                    who is listening, and under what name
     agent-mailbox threads
     agent-mailbox thread <slug>
+
+  Adapters  (vendor:thread_id — same envelope as the hub)
+    agent-mailbox claude send|listen|channel|serve
+    agent-mailbox adapter serve [--port 8788]
+    agent-mailbox adapter send --from <addr> --to <addr> --body <text>
+    agent-mailbox adapt chatgpt|codex --thread <id>
+    agent-mailbox adapt send --to <vendor:thread> --reply-to <addr> [--body <text>]
+    agent-mailbox adapt serve chatgpt|codex --thread <id> [--port 8790]
 `;
 
 async function main(): Promise<void> {
@@ -127,6 +163,9 @@ async function main(): Promise<void> {
       const store = new MailStore({ dir: config.dataDir });
       const agents = new AgentRegistry(config.agents);
       const adapters = AdapterRegistry.withStubs();
+      registerClaudeAdapter(adapters);
+      registerCursorGrokAdapters(adapters);
+      registerOpenaiAdapters(adapters);
       const hub = new MailboxHub({ store, agents, adapters });
       const server = createHttpServer({
         store,
@@ -289,6 +328,21 @@ async function main(): Promise<void> {
       return;
     }
 
+    case 'claude': {
+      const { runClaudeCli } = await import('./adapters/claude/cli.js');
+      await runClaudeCli([...positional, ...argvFlags(flags)]);
+      return;
+    }
+
+    case 'adapter':
+      await adapterCommand(positional, flags);
+      return;
+
+    case 'adapt': {
+      await adaptCommand(positional, flags);
+      return;
+    }
+
     default:
       process.stdout.write(USAGE);
       if (command !== 'help') process.exit(1);
@@ -338,6 +392,198 @@ function render(message: Message, full: boolean): void {
       `${body}\n` +
       `(id ${message.id} seq ${message.seq} ${message.ts})\n\n`
   );
+}
+
+async function adapterCommand(positional: string[], flags: Flags): Promise<void> {
+  const sub = positional[0] ?? 'help';
+  const hub = defaultAdapterHub();
+
+  if (sub === 'serve') {
+    const port = Number(str(flags, 'port', process.env['ADAPTER_PORT'] ?? '8788'));
+    const host = str(flags, 'host', process.env['ADAPTER_HOST'] ?? '127.0.0.1')!;
+    const server = createAdapterServer(hub);
+    server.requestTimeout = 0;
+    server.headersTimeout = 0;
+    await new Promise<void>((resolve) => server.listen(port, host, resolve));
+    process.stdout.write(
+      `cursor+grok adapter on http://${host}:${port}\n` +
+        `  POST /v1/send   {from,to,reply_to,body}\n` +
+        `  GET  /v1/receive?address=cursor:bc-…&wait=ms\n`
+    );
+
+    const token = str(flags, 'token', process.env['MAILBOX_TOKEN']);
+    const mailboxUrl = str(flags, 'url', process.env['MAILBOX_URL']);
+    if (token && mailboxUrl) {
+      const client = await createMailboxClient(mailboxUrl, token);
+      process.stdout.write(`  mailbox bridge ${mailboxUrl} as ${(await client.whoami()).agent.id}\n`);
+      void runMailboxBridge(hub, client).catch((error: unknown) => {
+        process.stderr.write(`bridge: ${error instanceof Error ? error.message : String(error)}\n`);
+      });
+    }
+    return;
+  }
+
+  if (sub === 'send') {
+    const from = str(flags, 'from');
+    const to = str(flags, 'to');
+    const body = str(flags, 'body') ?? (process.stdin.isTTY ? undefined : readFileSync(0, 'utf8'));
+    if (!from || !to || !body?.trim()) die('adapter send needs --from, --to and --body');
+    const replyTo = str(flags, 'reply-to');
+    const envelope = createEnvelope({
+      from,
+      to,
+      body,
+      ...(replyTo ? { reply_to: replyTo } : {}),
+    });
+    const result = await hub.send(envelope);
+    process.stdout.write(
+      `${JSON.stringify({ ...result.envelope, transport: result.transport, native_id: result.nativeId ?? null }, null, 2)}\n`
+    );
+    if (flags['wait'] === true) {
+      const received = await hub.receive(to, result.nativeId, 180_000);
+      for (const reply of received.envelopes) {
+        process.stdout.write(`${JSON.stringify(reply, null, 2)}\n`);
+      }
+    }
+    return;
+  }
+
+  if (sub === 'listen') {
+    const address = str(flags, 'address') ?? positional[1];
+    if (!address) die('adapter listen needs --address {vendor}:{thread_id}');
+    if (!parseAddress(address)) die(`address must be vendor:thread_id (got ${address})`);
+    let cursor = str(flags, 'cursor');
+    for (;;) {
+      const received = await hub.receive(address, cursor, 25_000);
+      for (const envelope of received.envelopes) {
+        process.stdout.write(`${JSON.stringify(envelope, null, 2)}\n`);
+      }
+      cursor = received.cursor;
+    }
+  }
+
+  process.stdout.write(USAGE);
+  if (sub !== 'help') process.exit(1);
+}
+
+async function adaptCommand(positional: string[], flags: Flags): Promise<void> {
+  const sub = positional[0];
+  if (sub === 'send') {
+    await adaptSend(flags);
+    return;
+  }
+  if (sub === 'serve') {
+    const vendor = positional[1];
+    if (vendor !== 'codex' && vendor !== 'chatgpt') {
+      die('adapt serve needs a vendor: chatgpt | codex');
+    }
+    const thread = str(flags, 'thread') ?? positional[2];
+    if (!thread) die('adapt serve needs --thread <id>');
+    const adapter = makeAdapter(vendor, flags);
+    const port = Number(str(flags, 'port', '8790'));
+    const adapterToken = str(flags, 'token', process.env['MAILBOX_ADAPTER_TOKEN']);
+    const server = createAdapterHttpServer({
+      adapter,
+      ...(adapterToken ? { token: adapterToken } : {}),
+      replyTimeoutMs: Number(str(flags, 'reply-timeout', '180000')),
+    });
+    const stop = adapter.listen(thread, (body) => {
+      process.stderr.write(`native reply on ${vendor}:${thread} (${body.length} chars)\n`);
+    });
+    const shutdown = (): void => {
+      stop();
+      server.close(() => process.exit(0));
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+    await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));
+    process.stdout.write(
+      `adapter ${vendor} on http://127.0.0.1:${port}\n` +
+        `  POST /send { "threadId": "${thread}", "envelope": { ... } }\n` +
+        (vendor === 'chatgpt' && process.platform !== 'darwin' ? `${MAC_SETUP}\n` : '')
+    );
+    return;
+  }
+  if (sub !== 'codex' && sub !== 'chatgpt') {
+    die('adapt needs chatgpt | codex | send | serve');
+  }
+  const thread = str(flags, 'thread') ?? positional[1];
+  if (!thread) die(`adapt ${sub} needs --thread <id>`);
+  const { url, token } = clientConfig(flags);
+  const adapter = makeAdapter(sub, flags);
+  const httpPort = str(flags, 'http-port');
+  if (httpPort) {
+    const adapterToken = str(flags, 'adapter-token', process.env['MAILBOX_ADAPTER_TOKEN']);
+    const server = createAdapterHttpServer({
+      adapter,
+      ...(adapterToken ? { token: adapterToken } : {}),
+      replyTimeoutMs: Number(str(flags, 'reply-timeout', '180000')),
+    });
+    await new Promise<void>((resolve) => server.listen(Number(httpPort), '127.0.0.1', resolve));
+    process.stderr.write(`adapter http on http://127.0.0.1:${httpPort}/send\n`);
+  }
+  await runBridge({
+    hub: new HubClient({ url, token }),
+    adapter,
+    threadId: thread,
+    replyTimeoutMs: Number(str(flags, 'reply-timeout', '600000')),
+  });
+}
+
+function makeAdapter(vendor: 'codex' | 'chatgpt', flags: Flags): ListeningAdapter {
+  if (vendor === 'codex') {
+    const bin = str(flags, 'codex-bin');
+    return createVendorAdapter('codex', {
+      preferQueue: flags['no-queue'] !== true,
+      ...(bin ? { bin } : {}),
+    });
+  }
+  const wrapperUrl = str(flags, 'wrapper');
+  return createVendorAdapter('chatgpt', {
+    ...(wrapperUrl ? { wrapperUrl } : {}),
+  });
+}
+
+async function adaptSend(flags: Flags): Promise<void> {
+  const to = str(flags, 'to');
+  const replyTo = str(flags, 'reply-to');
+  if (!to || !replyTo) die('adapt send needs --to vendor:thread_id and --reply-to <addr>');
+  const dest = parseAddress(to);
+  if (!dest) die(`adapt send needs --to vendor:thread_id (got ${to})`);
+  const vendor = dest.vendor;
+  if (vendor !== 'codex' && vendor !== 'chatgpt') {
+    die(`adapt send only implements codex and chatgpt addresses (got ${to})`);
+  }
+  const threadId = dest.thread_id;
+  const body = str(flags, 'body') ?? readFileSync(0, 'utf8');
+  if (!body.trim()) die('empty body: pass --body <text> or pipe it on stdin');
+  const fromRaw = str(flags, 'from') ?? 'local:cli';
+  const from = parseAddress(fromRaw) ?? { vendor: dest.vendor, thread_id: fromRaw };
+  const replyParsed = parseAddress(replyTo);
+  const reply_to = replyParsed ?? { vendor: 'agent', thread_id: replyTo };
+  const correlationId = str(flags, 'correlation-id');
+  const envelope: Envelope = {
+    id: newEnvelopeId(),
+    from,
+    to: dest,
+    reply_to,
+    ...(correlationId ? { correlation_id: correlationId } : {}),
+    body,
+    created_at: new Date().toISOString(),
+  };
+  const adapter = makeAdapter(vendor, flags);
+  const waiting = flags['wait'] === true ? adapter.replies.wait(threadId, 600_000) : undefined;
+  const stop = adapter.listen(threadId, () => undefined);
+  try {
+    await adapter.send(threadId, envelope);
+    process.stdout.write(`injected ${envelope.id} into ${formatAddress(dest)}\n`);
+    if (waiting) {
+      const reply = await waiting;
+      process.stdout.write(`${reply}\n`);
+    }
+  } finally {
+    stop();
+  }
 }
 
 main().catch((error: unknown) => {

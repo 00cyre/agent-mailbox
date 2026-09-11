@@ -201,8 +201,11 @@ hub routes on `to.vendor` to that vendor's adapter: `send(threadId, envelope)`.
 Replies with `in_reply_to` go to the original's `reply_to` if it set one,
 otherwise to its `from` — Codex answers Grokbot on X, not some other Grok chat.
 
-Vendors: `claude`, `cursor`, `grok`, `codex`, `chatgpt` (extensible). Adapters
-in this repo are stubs; native send-to-thread lives in a vendor adapter.
+Vendors: `claude`, `cursor`, `grok`, `codex`, `chatgpt` (extensible). `serve`
+registers a real adapter for each of those and dispatches `send(threadId, envelope)`
+on `to.vendor`. Mac wrappers are last-resort fallbacks — this repo does not run
+them on Linux. Setup notes: `macos/SETUP.md`, `macos/README.md`,
+`src/adapters/claude/MAC.md`.
 Listen/ack is unchanged: `GET /v1/inbox?cursor=N` — the cursor is the ack.
 
 ## Protocol

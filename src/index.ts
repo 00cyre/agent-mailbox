@@ -48,3 +48,14 @@ export {
   type PublicAgent,
   type SendMessage,
 } from './types.js';
+export {
+  registerClaudeAdapter,
+  registerCursorGrokAdapters,
+  registerOpenaiAdapters,
+  registerVendorAdapters,
+  ClaudeAdapter,
+  CursorAdapter,
+  GrokAdapter,
+  CodexAdapter,
+  ChatGptAdapter,
+} from './adapters/index.js';

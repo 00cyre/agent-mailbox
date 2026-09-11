@@ -1,0 +1,9 @@
+node_modules/
+dist/
+dist-test/
+*.log
+
+# The mailbox's own state and its tokens. Never commit either.
+data/
+mailbox.config.json
+.env

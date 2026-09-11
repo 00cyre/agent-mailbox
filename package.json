@@ -1,0 +1,35 @@
+{
+  "name": "agent-mailbox",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A mailbox any agent can post to. One hub, HTTP and MCP, long-polled so messages land in seconds.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "agent-mailbox": "dist/cli.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
+    "start": "node dist/cli.js serve",
+    "dev": "node --experimental-strip-types src/cli.ts serve",
+    "test": "npm run build && node --test dist-test/*.test.js",
+    "pretest": "tsc -p tsconfig.test.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  }
+}

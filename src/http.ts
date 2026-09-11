@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AgentRegistry } from './config.js';
 import type { MailStore } from './store.js';
 import type { Agent } from './types.js';
-import { publicAgent, sendMessage } from './types.js';
+import { publicAgent, registerChat, sendMessage } from './types.js';
 
 /**
  * The HTTP face of the mailbox.
@@ -16,6 +16,8 @@ import { publicAgent, sendMessage } from './types.js';
 const MAX_BODY_BYTES = 512 * 1024;
 const MAX_WAIT_MS = 300_000;
 const DEFAULT_WAIT_MS = 25_000;
+/** A chat whose listener polled inside this window counts as present. */
+const LISTENING_WINDOW_MS = 90_000;
 
 export interface HttpDeps {
   store: MailStore;
@@ -113,15 +115,59 @@ export function createHttpServer(deps: HttpDeps): Server {
       return json(res, 200, { data: agents.list().map(publicAgent) });
     }
 
+    // A chat claims its name as an address. Idempotent for the same owner, so
+    // a listener just calls it every time it starts.
+    if (req.method === 'POST' && path === '/v1/chats') {
+      const parsed = registerChat.safeParse(await readBody(req));
+      if (!parsed.success) return fail(res, 400, 'invalid chat', parsed.error.format());
+      try {
+        return json(res, 201, store.registerChat(agent.id, parsed.data.name));
+      } catch (error) {
+        return fail(res, 409, error instanceof Error ? error.message : String(error));
+      }
+    }
+
+    // How a sender finds out where to write. This is the list a human reads
+    // when they are about to paste a chat name into another agent's prompt.
+    if (req.method === 'GET' && path === '/v1/chats') {
+      return json(res, 200, {
+        data: store.chats().map((chat) => ({
+          slug: chat.slug,
+          name: chat.name,
+          last_seen: chat.lastSeen,
+          // Mail to a quiet chat still queues; this only says whether someone
+          // is likely to read it soon.
+          listening: Date.now() - Date.parse(chat.lastSeen) < LISTENING_WINDOW_MS,
+        })),
+      });
+    }
+
     if (req.method === 'POST' && path === '/v1/send') {
       if (agent.canSend === false) return fail(res, 403, `agent "${agent.id}" is read-only`);
       const parsed = sendMessage.safeParse(await readBody(req));
       if (!parsed.success) return fail(res, 400, 'invalid message', parsed.error.format());
-      if (parsed.data.to !== '*' && !agents.has(parsed.data.to)) {
-        // Better a 404 than a message that is accepted and read by nobody.
-        return fail(res, 404, `no agent "${parsed.data.to}" on this mailbox`);
+
+      // Resolution order: broadcast, a registered agent, then a chat by slug or
+      // by the display name someone pasted out of their client.
+      const raw = parsed.data.to;
+      let to: string;
+      if (raw === '*') to = '*';
+      else if (agents.has(raw)) to = raw;
+      else {
+        const chat = store.resolveChat(raw);
+        if (!chat) {
+          // Better a 404 than a message accepted and read by nobody. Name the
+          // list that would have answered the question.
+          return fail(
+            res,
+            404,
+            `no agent or chat "${raw}" on this mailbox — GET /v1/chats lists the chats that are listening`
+          );
+        }
+        to = chat.slug;
       }
-      const message = store.send(agent.id, parsed.data);
+
+      const message = store.send(agent.id, { ...parsed.data, to });
       return json(res, 201, message);
     }
 
@@ -129,10 +175,26 @@ export function createHttpServer(deps: HttpDeps): Server {
       const cursor = intParam(url, 'cursor', 0);
       const wait = Math.min(Math.max(intParam(url, 'wait', DEFAULT_WAIT_MS), 0), MAX_WAIT_MS);
       const thread = url.searchParams.get('thread') ?? undefined;
+
+      // A listener reads a chat's inbox rather than its own. Only the agent
+      // that registered the chat may do so, or one token would read another
+      // session's mail.
+      const chatParam = url.searchParams.get('chat');
+      let address = agent.id;
+      if (chatParam !== null) {
+        const chat = store.resolveChat(chatParam);
+        if (!chat) return fail(res, 404, `no chat "${chatParam}"`);
+        if (chat.owner !== agent.id) {
+          return fail(res, 403, `chat "${chat.slug}" belongs to "${chat.owner}"`);
+        }
+        address = chat.slug;
+        store.touchChat(chat.slug);
+      }
+
       const messages =
         wait > 0
-          ? await store.wait(agent.id, cursor, wait, thread)
-          : store.since(agent.id, cursor, thread);
+          ? await store.wait(address, cursor, wait, thread)
+          : store.since(address, cursor, thread);
       // The cursor to send next time. Unchanged on an empty poll, so a reader
       // that times out simply asks again with the same number.
       const next = messages.length > 0 ? messages[messages.length - 1]!.seq : cursor;

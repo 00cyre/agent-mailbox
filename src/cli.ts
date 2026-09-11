@@ -93,7 +93,10 @@ const USAGE = `agent-mailbox — a mailbox any agent can post to
                                            body also reads stdin when --body is absent
     agent-mailbox inbox [--cursor <n>] [--thread <slug>]
     agent-mailbox watch [--thread <slug>] [--full]
-                                           long-poll forever, one block per message
+                                           long-poll your own inbox, forever
+    agent-mailbox listen --as "<chat name>" [--full]
+                                           claim a chat name and receive its mail
+    agent-mailbox chats                    who is listening, and under what name
     agent-mailbox threads
     agent-mailbox thread <slug>
 `;
@@ -207,27 +210,47 @@ async function main(): Promise<void> {
       // Start at head, not zero: a watcher reports what arrives from now on.
       // Replaying the backlog on every restart would make a crash loop look
       // like a flood of new mail.
-      let cursor = Number(str(flags, 'cursor', String(whoami.head)));
+      const cursor = Number(str(flags, 'cursor', String(whoami.head)));
       const thread = str(flags, 'thread');
-      const full = flags['full'] === true;
+      const extra = thread ? `thread=${encodeURIComponent(thread)}` : '';
+      await pollLoop(url, token, extra, cursor, flags['full'] === true);
+      return;
+    }
 
-      for (;;) {
-        const params = new URLSearchParams({ wait: '120000', cursor: String(cursor) });
-        if (thread) params.set('thread', thread);
-        try {
-          const result = (await api(url, token, `/v1/inbox?${params}`)) as {
-            data: Message[];
-            cursor: number;
-          };
-          for (const message of result.data) render(message, full);
-          cursor = result.cursor;
-        } catch (error) {
-          // The hub restarting mid-poll is normal, not fatal. Report it on
-          // stderr so a watcher does not mistake it for a message, and retry.
-          process.stderr.write(`watch: ${error instanceof Error ? error.message : String(error)}\n`);
-          await new Promise((r) => setTimeout(r, 3_000));
-        }
+    case 'listen': {
+      const { url, token } = clientConfig(flags);
+      const name = str(flags, 'as') ?? positional[0];
+      if (!name) die('listen needs the chat name: --as "Project status check"');
+
+      // Claim the name first, then poll it. Registration is idempotent for the
+      // same token, so this is also how a restarted listener reconnects.
+      const chat = (await api(url, token, '/v1/chats', {
+        method: 'POST',
+        body: JSON.stringify({ name }),
+      })) as { slug: string; name: string };
+      process.stderr.write(`listening as "${chat.name}" (${chat.slug})\n`);
+
+      let cursor = Number(str(flags, 'cursor', '-1'));
+      if (cursor < 0) {
+        const whoami = (await api(url, token, '/v1/whoami')) as { head: number };
+        cursor = whoami.head;
       }
+      await pollLoop(url, token, `chat=${encodeURIComponent(chat.slug)}`, cursor, flags['full'] === true);
+      return;
+    }
+
+    case 'chats': {
+      const { url, token } = clientConfig(flags);
+      const result = (await api(url, token, '/v1/chats')) as {
+        data: { slug: string; name: string; listening: boolean; last_seen: string }[];
+      };
+      if (result.data.length === 0) process.stdout.write('no chats registered yet\n');
+      for (const chat of result.data) {
+        process.stdout.write(
+          `${chat.listening ? '●' : '○'} ${chat.name}\n    slug: ${chat.slug}  last seen ${chat.last_seen}\n`
+        );
+      }
+      return;
     }
 
     case 'threads': {
@@ -257,6 +280,39 @@ async function main(): Promise<void> {
     default:
       process.stdout.write(USAGE);
       if (command !== 'help') process.exit(1);
+  }
+}
+
+/**
+ * Long-poll forever, printing each message as it lands.
+ *
+ * Never exits and never throws: a watcher that dies when the hub bounces is
+ * worse than useless, because silence and "no messages" look identical from the
+ * outside. Failures go to stderr — stdout is the message stream, and a
+ * monitoring harness reading it should not see an error as mail.
+ */
+async function pollLoop(
+  url: string,
+  token: string,
+  extra: string,
+  from: number,
+  full: boolean
+): Promise<never> {
+  let cursor = from;
+  for (;;) {
+    const params = new URLSearchParams({ wait: '120000', cursor: String(cursor) });
+    const query = extra ? `${params}&${extra}` : `${params}`;
+    try {
+      const result = (await api(url, token, `/v1/inbox?${query}`)) as {
+        data: Message[];
+        cursor: number;
+      };
+      for (const message of result.data) render(message, full);
+      cursor = result.cursor;
+    } catch (error) {
+      process.stderr.write(`poll: ${error instanceof Error ? error.message : String(error)}\n`);
+      await new Promise((r) => setTimeout(r, 3_000));
+    }
   }
 }
 

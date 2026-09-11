@@ -72,14 +72,41 @@ export function createMailboxMcpServer(deps: McpDeps): McpServer {
   );
 
   server.registerTool(
+    'list_chats',
+    {
+      title: 'List chats',
+      description:
+        'Chats you can write to, by name. A chat is a human\'s conversation with an assistant; ' +
+        'sending to one makes the message appear there. "listening" means someone is reading it ' +
+        'right now — mail to a quiet chat still queues.',
+      inputSchema: {},
+    },
+    () =>
+      json({
+        chats: store.chats().map((chat) => ({
+          name: chat.name,
+          slug: chat.slug,
+          listening: Date.now() - Date.parse(chat.lastSeen) < 90_000,
+          last_seen: chat.lastSeen,
+        })),
+      })
+  );
+
+  server.registerTool(
     'send_message',
     {
       title: 'Send a message',
       description:
-        'Post a message to another agent. Returns immediately with the stored message; it does ' +
-        'not wait for a reply — follow with wait_for_message on the same thread for that.',
+        'Post a message to another agent, or to a chat so it appears in that conversation. ' +
+        'Returns immediately with the stored message; it does not wait for a reply — follow with ' +
+        'wait_for_message on the same thread for that.',
       inputSchema: {
-        to: z.string().describe('Recipient agent id, or "*" to broadcast to everyone else.'),
+        to: z
+          .string()
+          .describe(
+            'Recipient: an agent id, or a chat name exactly as the human gave it to you ' +
+              '(e.g. "Project status check"). Call list_chats if unsure. "*" broadcasts.'
+          ),
         thread: z
           .string()
           .describe('Conversation slug. Reuse it for a follow-up so the other side keeps context.'),
@@ -92,11 +119,22 @@ export function createMailboxMcpServer(deps: McpDeps): McpServer {
     (args) => {
       try {
         if (agent.canSend === false) throw new Error(`agent "${agent.id}" is read-only`);
-        if (args.to !== '*' && !agents.has(args.to)) {
-          throw new Error(`no agent "${args.to}" on this mailbox; call list_agents`);
+
+        // Same resolution as the HTTP face: agent id, then chat by slug or by
+        // the display name a human pasted in.
+        let to = args.to;
+        if (to !== '*' && !agents.has(to)) {
+          const chat = store.resolveChat(to);
+          if (!chat) {
+            throw new Error(
+              `no agent or chat "${to}" on this mailbox; call list_chats or list_agents`
+            );
+          }
+          to = chat.slug;
         }
+
         const message = store.send(agent.id, {
-          to: args.to,
+          to,
           thread: args.thread,
           subject: args.subject,
           body: args.body,

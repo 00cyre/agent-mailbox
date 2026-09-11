@@ -15,16 +15,58 @@ export const AGENT_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 /** A thread is a conversation. Reusing one is how context survives across messages. */
 export const THREAD_ID = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
 
+/**
+ * Chats are addresses too, and they are the point of the whole package.
+ *
+ * A human copies a chat's name out of their client — "Project status check
+ * (fork)" — pastes it into some other agent's instructions, and that agent can
+ * write to it. So the address has to survive a round trip through a sentence:
+ * mixed case, spaces, parentheses. `slugify` is what makes the pasted name and
+ * the stored one the same address, and it has to be applied on both sides or
+ * senders will be told a chat they can plainly see does not exist.
+ */
+export function slugify(name: string): string {
+  return name
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/gu, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, '-')
+    .replace(/^-+|-+$/gu, '')
+    .slice(0, 96);
+}
+
+export interface Chat {
+  /** The address. Derived from `name`, stable, safe in a URL. */
+  slug: string;
+  /** As the human typed it, for display and for matching a pasted name. */
+  name: string;
+  /** Agent id that registered it. Only that agent may re-register or read it. */
+  owner: string;
+  created: string;
+  /**
+   * Last time a listener polled. A sender reads this to know whether anyone is
+   * home; mail to a quiet chat still queues, because this is a mailbox.
+   */
+  lastSeen: string;
+}
+
+export const registerChat = z
+  .object({
+    name: z.string().min(1).max(160),
+  })
+  .strict();
+
 export const MESSAGE_TYPES = ['message', 'request', 'reply', 'ack'] as const;
 export type MessageType = (typeof MESSAGE_TYPES)[number];
 
 /** What a client may send. `from`, `id`, `seq` and `ts` are the server's to assign. */
 export const sendMessage = z
   .object({
-    to: z
-      .string()
-      .max(64)
-      .refine((v) => v === '*' || AGENT_ID.test(v), 'must be an agent id or "*" for broadcast'),
+    // Deliberately permissive: an agent id, a chat slug, a chat's display name
+    // pasted verbatim out of a client, or "*". The server resolves it and says
+    // so if it cannot — rejecting "Project status check (fork)" here for having
+    // spaces in it would be rejecting the package's main use case.
+    to: z.string().min(1).max(160),
     thread: z.string().regex(THREAD_ID, 'thread must be a plain slug'),
     subject: z.string().min(1).max(200),
     body: z.string().min(1).max(256_000),

@@ -102,7 +102,10 @@ describe('send', () => {
       body: 'b',
     });
     assert.equal(status, 404);
-    assert.match(body.error.message, /no agent "nobody"/u);
+    assert.match(body.error.message, /no agent or chat "nobody"/u);
+    // The error has to name the way out, or a sending agent's only recovery is
+    // to guess.
+    assert.match(body.error.message, /\/v1\/chats/u);
   });
 
   it('refuses a read-only agent', async () => {
@@ -147,6 +150,86 @@ describe('inbox', () => {
       body.data.filter((m: { thread: string }) => m.thread === 'private'),
       []
     );
+  });
+});
+
+describe('chats', () => {
+  const register = (token: string, name: string) =>
+    call('/v1/chats', token, { method: 'POST', body: JSON.stringify({ name }) });
+
+  it('claims a human-readable name and derives a slug', async () => {
+    const { status, body } = await register(ALICE, 'Project status check (fork)');
+    assert.equal(status, 201);
+    assert.equal(body.slug, 'project-status-check-fork');
+    assert.equal(body.name, 'Project status check (fork)');
+    assert.equal(body.owner, 'alice');
+  });
+
+  it('is idempotent for the same owner, so a restarted listener just reconnects', async () => {
+    await register(ALICE, 'Restart Me');
+    const second = await register(ALICE, 'Restart Me');
+    assert.equal(second.status, 201);
+    assert.equal(second.body.slug, 'restart-me');
+  });
+
+  it('refuses a name another agent already owns', async () => {
+    await register(ALICE, 'Mine');
+    const { status } = await register(BOB, 'Mine');
+    assert.equal(status, 409);
+  });
+
+  it('accepts the display name pasted verbatim as the address', async () => {
+    await register(ALICE, 'Deploy Notes');
+    // This is the whole use case: a human copies the chat name out of their
+    // client and pastes it into another agent's prompt, spaces and all.
+    const sent = await send(BOB, {
+      to: 'Deploy Notes',
+      thread: 'research',
+      subject: 'done',
+      body: 'finished the sweep',
+    });
+    assert.equal(sent.status, 201);
+    assert.equal(sent.body.to, 'deploy-notes');
+
+    const { body } = await call('/v1/inbox?chat=deploy-notes&cursor=0&wait=0', ALICE);
+    assert.equal(body.data.length, 1);
+    assert.equal(body.data[0].subject, 'done');
+  });
+
+  it('accepts the slug too, and matches case-insensitively', async () => {
+    await register(ALICE, 'Case Test');
+    for (const to of ['case-test', 'CASE TEST', 'Case  Test']) {
+      assert.equal((await send(BOB, { to, thread: 't', subject: 's', body: 'b' })).status, 201, to);
+    }
+  });
+
+  it('will not let another agent read a chat it does not own', async () => {
+    await register(ALICE, 'Alice Only');
+    const { status } = await call('/v1/inbox?chat=alice-only&cursor=0&wait=0', BOB);
+    assert.equal(status, 403);
+  });
+
+  it('lists chats with a presence flag a sender can act on', async () => {
+    await register(ALICE, 'Listed Chat');
+    const { body } = await call('/v1/chats', BOB);
+    const found = body.data.find((c: { slug: string }) => c.slug === 'listed-chat');
+    assert.ok(found, 'a sender must be able to discover where to write');
+    assert.equal(found.name, 'Listed Chat');
+    assert.equal(typeof found.listening, 'boolean');
+  });
+
+  it('rejects a name with nothing addressable in it', async () => {
+    const { status } = await register(ALICE, '!!! ???');
+    assert.equal(status, 409);
+  });
+
+  it('delivers to a chat whose listener is away, for reading later', async () => {
+    await register(ALICE, 'Away Chat');
+    await send(BOB, { to: 'Away Chat', thread: 't', subject: 'queued', body: 'b' });
+    // Nobody was polling. It is a mailbox, so the message waits.
+    const { body } = await call('/v1/inbox?chat=away-chat&cursor=0&wait=0', ALICE);
+    assert.equal(body.data.length, 1);
+    assert.equal(body.data[0].subject, 'queued');
   });
 });
 

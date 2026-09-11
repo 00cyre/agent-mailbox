@@ -1,7 +1,8 @@
-import { appendFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
-import type { Message, SendMessage } from './types.js';
+import type { Chat, Message, SendMessage } from './types.js';
+import { slugify } from './types.js';
 
 /**
  * The mailbox itself: an append-only log plus the readers waiting on it.
@@ -35,17 +36,22 @@ interface Waiter {
 export class MailStore {
   readonly #dir: string;
   readonly #file: string;
+  readonly #chatsFile: string;
   readonly #window: number;
   #messages: Message[] = [];
   #seq = 0;
   #waiters = new Set<Waiter>();
+  #chats = new Map<string, Chat>();
+  #chatsDirty = false;
 
   constructor(options: StoreOptions) {
     this.#dir = options.dir;
     this.#window = options.window ?? DEFAULT_WINDOW;
     this.#file = join(this.#dir, 'messages.jsonl');
+    this.#chatsFile = join(this.#dir, 'chats.json');
     mkdirSync(this.#dir, { recursive: true });
     this.#load();
+    this.#loadChats();
   }
 
   #load(): void {
@@ -181,8 +187,84 @@ export class MailStore {
     }
   }
 
+  // ---------------------------------------------------------------- chats
+
+  /**
+   * Claim a chat name as an address.
+   *
+   * Re-registering is the normal case, not an error: a session restarts, or
+   * reconnects after the hub bounced, and announces the same name again. What
+   * is refused is a *different* agent claiming a name already taken, because
+   * the whole guarantee is that mail addressed to a chat reaches that chat.
+   */
+  registerChat(owner: string, name: string): Chat {
+    const slug = slugify(name);
+    if (!slug) throw new Error(`"${name}" has no addressable characters in it`);
+
+    const now = new Date().toISOString();
+    const existing = this.#chats.get(slug);
+    if (existing) {
+      if (existing.owner !== owner) {
+        throw new Error(`chat "${slug}" is already registered by "${existing.owner}"`);
+      }
+      // Keep `created`, refresh the display name — a chat can be renamed as
+      // long as it still slugifies the same.
+      existing.name = name;
+      existing.lastSeen = now;
+      this.#saveChats();
+      return existing;
+    }
+
+    const chat: Chat = { slug, name, owner, created: now, lastSeen: now };
+    this.#chats.set(slug, chat);
+    this.#saveChats();
+    return chat;
+  }
+
+  /** Resolve an agent id, a chat slug, or a chat's display name pasted verbatim. */
+  resolveChat(to: string): Chat | undefined {
+    return this.#chats.get(to) ?? this.#chats.get(slugify(to));
+  }
+
+  chats(): Chat[] {
+    return [...this.#chats.values()].sort((a, b) => b.lastSeen.localeCompare(a.lastSeen));
+  }
+
+  /** Mark a chat as still listening. Called on every poll by its listener. */
+  touchChat(slug: string): void {
+    const chat = this.#chats.get(slug);
+    if (!chat) return;
+    chat.lastSeen = new Date().toISOString();
+    // Not persisted on every poll — a listener touches this every few seconds
+    // and the only thing lost on a crash is a slightly stale `lastSeen`.
+    this.#chatsDirty = true;
+  }
+
+  /** Flush presence updates. The server calls this on a timer. */
+  flushChats(): void {
+    if (!this.#chatsDirty) return;
+    this.#saveChats();
+  }
+
+  #loadChats(): void {
+    if (!existsSync(this.#chatsFile)) return;
+    try {
+      const chats = JSON.parse(readFileSync(this.#chatsFile, 'utf8')) as Chat[];
+      for (const chat of chats) this.#chats.set(chat.slug, chat);
+    } catch {
+      // A corrupt registry loses addresses, not messages. Listeners re-register
+      // on their next start, so booting empty beats refusing to boot.
+    }
+  }
+
+  #saveChats(): void {
+    writeFileSync(this.#chatsFile, `${JSON.stringify([...this.#chats.values()], null, 2)}\n`, 'utf8');
+    this.#chatsDirty = false;
+  }
+
   /** Release every pending long poll. Call before exiting so the process can end. */
   close(): void {
+    this.flushChats();
     for (const waiter of [...this.#waiters]) {
       clearTimeout(waiter.timer);
       waiter.resolve([]);
